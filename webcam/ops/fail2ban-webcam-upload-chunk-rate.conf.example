@@ -1,0 +1,12 @@
+[Definition]
+
+# Chunk-v1 braucht ein deutlich groesseres Budget als der Legacy-Weg: Ein
+# einziges Bild besteht aus mehreren Teilanfragen plus Aushandlung und
+# Abschluss. Der Filter trennt diesen Verkehr deshalb bewusst vom normalen
+# upload.php-Limit, erfasst aber dieselben vier oeffentlichen Prefixvarianten.
+# Fail2Ban nimmt den erkannten Apache-Zeitstempel vor dem Regex-Abgleich aus
+# der Zeile. Der Mittelteil muss daher das Benutzerfeld und diese entfernte
+# Stelle flexibel ueberbruecken; ein zweiter Datumsabgleich wuerde nie treffen.
+failregex = ^<HOST> - .* "POST /(?:(?:webcam|webcam2|testx)/)?include/upload-chunk\.php(?:\?[^ ]*)? HTTP/[0-9.]+" [0-9]{3} (?:[0-9]+|-)(?: .*)?$
+
+ignoreregex =

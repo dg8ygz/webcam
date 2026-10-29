@@ -1,0 +1,1721 @@
+#!/usr/bin/env bash
+
+# Camera-RPi Mehrserver-Worker
+#
+# Ein Worker ist ein dauerhaft laufendes Arbeitsprogramm fuer EINEN Zielserver.
+# Er holt dort Auftraege ab und liefert Bilder mit dessen Zugangsschluessel ab.
+# Bei aktiviertem Pool teilen alle Zielserver dieselbe physische Aufnahme.
+# Die gemeinsame Kamerasperre verhindert gleichzeitige Kameraaktionen. Beim
+# eigentlichen Netzwerk-Upload ist sie frei: Ein langsamer Server soll die
+# Kamera nicht fuer andere Ziele blockieren. Das gesendete Bild ist waehrend
+# des Uploads separat gegen Entfernen durch die Warteschlangenbereinigung gesperrt.
+#
+# Begriffe fuer das Lesen dieser Datei:
+# - Spool: Zwischenablage fuer noch offene Auftraege und noch zu sendende Bilder.
+#   Beim RAM-Betrieb geht ihr Inhalt durch einen Stromausfall/Neustart verloren.
+# - Pool: ein gemeinsames Bild mit einer eigenen Versandliste je Zielserver.
+# - Slot: geplanter Bildzeitpunkt, z.B. 12:00. Eine Aufnahme kann spaeter erfolgen.
+# - ACK: Bestaetigung des Zielservers nach den Regeln seines Upload-Protokolls.
+#   Normalfall: erst nach ACK entfernen. Bewusstes Verwerfen bei Limit oder
+#   Bilddefekt ist eine getrennte Fehlerbehandlung, keine Lieferbestaetigung.
+# - Sidecar: kleine Begleitdatei zum JPEG, etwa mit Wetter oder Aufnahmezeit.
+# - Atomar: erst eine fertige temporaere Datei unter dem endgueltigen Namen
+#   sichtbar machen; Leser sollen keine halb geschriebene Datei erhalten.
+#
+# Einstieg zum Nachvollziehen: run_iteration() am Dateiende. Die Hilfsfunktionen
+# davor erledigen Befehlspruefung, Aufnahme, Versand und Fehlerbehandlung.
+
+set -uo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+COMMON_LIB="${CAMERA_RPI_COMMON_LIB:-$SCRIPT_DIR/lib/camera-rpi-common.sh}"
+if [[ -z "${CAMERA_RPI_COMMON_LIB:-}" && ! -r "$COMMON_LIB" ]]; then
+  COMMON_LIB="/usr/local/libexec/camera-rpi-common.sh"
+fi
+
+if [[ ! -r "$COMMON_LIB" ]]; then
+  printf 'Gemeinsame Bibliothek fehlt: %s\n' "$COMMON_LIB" >&2
+  exit 1
+fi
+# Diese Datei ist Programmcode aus unserem Installationspaket, keine vom
+# Administrator eingegebene Konfiguration. Nur deshalb wird sie eingebunden.
+# shellcheck source=lib/camera-rpi-common.sh
+source "$COMMON_LIB"
+
+CURL_BIN="${CAMERA_RPI_CURL_BIN:-/usr/bin/curl}"
+GPHOTO_BIN="${CAMERA_RPI_GPHOTO_BIN:-/usr/bin/gphoto2}"
+V4L2_BIN="${CAMERA_RPI_V4L2_BIN:-/usr/bin/v4l2-ctl}"
+FINDMNT_BIN="${CAMERA_RPI_FINDMNT_BIN:-/usr/bin/findmnt}"
+MOUNT_BIN="${CAMERA_RPI_MOUNT_BIN:-/usr/bin/mount}"
+TIMEOUT_BIN="${CAMERA_RPI_TIMEOUT_BIN:-/usr/bin/timeout}"
+FLOCK_BIN="${CAMERA_RPI_FLOCK_BIN:-/usr/bin/flock}"
+DD_BIN="${CAMERA_RPI_DD_BIN:-/usr/bin/dd}"
+SHA256SUM_BIN="${CAMERA_RPI_SHA256SUM_BIN:-/usr/bin/sha256sum}"
+OPERATION_LOCK="${CAMERA_RPI_OPERATION_LOCK:-/run/lock/camera-rpi.operation.lock}"
+STATUS_PUBLISH_ROOT="${CAMERA_RPI_STATUS_ROOT:-/run/camera-rpi-status}"
+STATUS_PUBLISH_GROUP="${CAMERA_RPI_STATUS_GROUP:-www-data}"
+WEATHER_HELPER="${CAMERA_RPI_WEATHER_HELPER:-/usr/local/libexec/camera-rpi-weather.py}"
+TUNNEL_HELPER="${CAMERA_RPI_TUNNEL_HELPER:-/usr/local/libexec/camera-rpi-tunnel.py}"
+PRIVACY_HELPER="${CAMERA_RPI_PRIVACY_HELPER:-/usr/local/libexec/camera-rpi-privacy.php}"
+
+CONFIG_PATH=""
+RUN_ONCE=0
+CHECK_ONLY=0
+ROOT_RW_OWNED=0
+ROOT_RESTORE_FAILED=0
+WORKER_LOCK_FD=""
+OPERATION_LOCK_FD=""
+COMMAND_HEADER_FILE=""
+COMMAND_FORM_FILE=""
+UPLOAD_HEADER_FILE=""
+UPLOAD_FORM_FILE=""
+COMMAND_RESPONSE_FILE=""
+UPLOAD_RESPONSE_FILE=""
+UPLOAD_CHUNK_FILE=""
+STATUS_FILE=""
+HEARTBEAT_FILE=""
+
+usage() {
+  cat <<'EOF'
+Aufruf: camera-rpi-worker [--once|--check-config] SERVER.conf
+
+  ohne Option       dauerhaft auf Befehle warten
+  --once            genau einen Arbeitsdurchlauf ausfuehren
+  --check-config    Konfiguration und Key nur pruefen
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --once) RUN_ONCE=1 ;;
+    --check-config) CHECK_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) printf 'Unbekannte Option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *)
+      [[ -z "$CONFIG_PATH" ]] \
+        || { printf 'Nur eine Konfiguration ist erlaubt.\n' >&2; exit 2; }
+      CONFIG_PATH="$1"
+      ;;
+  esac
+  shift
+done
+
+[[ -n "$CONFIG_PATH" ]] || { usage >&2; exit 2; }
+[[ "$CONFIG_PATH" == /* ]] \
+  || CONFIG_PATH="$(cd -- "$(dirname -- "$CONFIG_PATH")" && pwd -P)/$(basename -- "$CONFIG_PATH")"
+
+cr_load_server_config "$CONFIG_PATH" || exit 1
+
+# Die Pool-Konfiguration schaltet gemeinsame automatische Aufnahmen ein.
+# Ohne diese Datei bleibt der bisherige Betrieb mit getrennten Zielauftraegen
+# erhalten. Eine vorhandene, aber unlesbare Pool-Konfiguration ist ein Fehler.
+POOL_ENABLED=0
+POOL_LIB="$(dirname -- "$COMMON_LIB")/camera-rpi-pool.sh"
+if [[ -r "$POOL_LIB" ]]; then
+  source "$POOL_LIB"
+  cr_pool_load || exit 1
+elif [[ -e "${CAMERA_RPI_POOL_CONFIG:-/etc/camera-rpi/capture-pool.conf}" ]]; then
+  cr_fail 'Pool konfiguriert, aber Poolbibliothek fehlt'; exit 1
+fi
+POOL_REQUIRED="$POOL_ENABLED"
+cr_source_load || exit 1
+
+# Die Binaerdateien sind fest vorgegeben. Testprogramme duerfen sie nur ueber
+# explizite CAMERA_RPI_*-Variablen ersetzen.
+CAPTURE_BIN="$GPHOTO_BIN"
+[[ "$CAPTURE_BACKEND" != v4l2 ]] || CAPTURE_BIN="$V4L2_BIN"
+[[ "$CAPTURE_BACKEND" != rtsp ]] || CAPTURE_BIN="${CAMERA_RPI_FFMPEG_BIN:-/usr/bin/ffmpeg}"
+for required_binary in "$CURL_BIN" "$CAPTURE_BIN" "$FINDMNT_BIN" \
+  "$MOUNT_BIN" "$TIMEOUT_BIN" "$FLOCK_BIN" "$DD_BIN" "$SHA256SUM_BIN"; do
+  [[ -x "$required_binary" ]] \
+    || { cr_fail "Erforderliches Programm ist nicht ausfuehrbar: $required_binary"; exit 1; }
+done
+
+if [[ "$CAPTURE_BACKEND" == v4l2 ]]; then
+  JPEG_HELPER="${CAMERA_RPI_JPEG_HELPER:-$(dirname -- "$COMMON_LIB")/camera-rpi-jpeg.py}"
+  [[ -x /usr/bin/python3 && -r "$JPEG_HELPER" ]] \
+    || { cr_fail "V4L2 benoetigt python3 und camera-rpi-jpeg.py"; exit 1; }
+fi
+
+# GD ist die PHP-Bildbibliothek. Ohne sie koennen wir nicht pruefen, ob ein
+# JPEG wirklich lesbar ist. Deshalb schon beim Konfigurationscheck abbrechen,
+# statt spaeter gute Bilder wegen eines fehlenden Pruefwerkzeugs auszusortieren.
+[[ -r "$CR_SOURCE_HELPER" ]] && /usr/bin/php -r 'exit(function_exists("imagecreatefromjpeg") ? 0 : 1);' \
+  || { cr_fail 'JPEG-Pruefung benoetigt camera-source.php und PHP-GD (php-gd)'; exit 1; }
+
+if (( CHECK_ONLY == 1 )); then
+  cr_read_secret "$KEY_FILE" || exit 1
+  unset CR_SECRET
+  cr_log INFO "Konfiguration und Key sind gueltig"
+  exit 0
+fi
+
+if (( ENABLED == 0 )); then
+  cr_log INFO "Server ist in seiner Konfiguration deaktiviert"
+  exit 0
+fi
+
+if (( MANAGE_ROOT_MOUNT == 1 && EUID != 0 )); then
+  cr_fail "Der Worker muss fuer den Read-only-Betrieb als root laufen"
+  exit 1
+fi
+
+mkdir -p -- "$SERVER_RUNTIME_DIR" || { cr_fail "Laufzeitverzeichnis kann nicht angelegt werden"; exit 1; }
+chmod 0700 "$RUNTIME_ROOT" "$SERVER_RUNTIME_DIR" 2>/dev/null || true
+
+COMMAND_HEADER_FILE="$SERVER_RUNTIME_DIR/command.header"
+COMMAND_FORM_FILE="$SERVER_RUNTIME_DIR/command.form"
+UPLOAD_HEADER_FILE="$SERVER_RUNTIME_DIR/upload.header"
+UPLOAD_FORM_FILE="$SERVER_RUNTIME_DIR/upload.form"
+COMMAND_RESPONSE_FILE="$SERVER_RUNTIME_DIR/command.response"
+COMMAND_RESPONSE_HEADERS="$SERVER_RUNTIME_DIR/command.response.headers"
+SERVER_UPLOAD_MODE=local
+EFFECTIVE_UPLOAD_MODE="$UPLOAD_MODE"
+if [[ -r "$SERVER_RUNTIME_DIR/upload-mode" ]]; then
+  read -r SERVER_UPLOAD_MODE < "$SERVER_RUNTIME_DIR/upload-mode" || SERVER_UPLOAD_MODE=local
+  case "$SERVER_UPLOAD_MODE" in local|legacy|chunked) ;; *) SERVER_UPLOAD_MODE=local ;; esac
+  [[ "$SERVER_UPLOAD_MODE" == local ]] || EFFECTIVE_UPLOAD_MODE="$SERVER_UPLOAD_MODE"
+fi
+UPLOAD_RESPONSE_FILE="$SERVER_RUNTIME_DIR/upload.response"
+UPLOAD_CHUNK_FILE="$SERVER_RUNTIME_DIR/upload.chunk"
+STATUS_FILE="$SERVER_RUNTIME_DIR/status"
+HEARTBEAT_FILE="$SERVER_RUNTIME_DIR/heartbeat"
+
+# Der Status ist eine einfache Datei ohne Geheimnisse. PHP und der
+# Healthcheck koennen sie lesen, ohne den Prozess oder dessen Argumente zu
+# untersuchen. Zeilenumbrueche werden entfernt, damit das Format eindeutig
+# bleibt.
+write_status() {
+  local state="$1"
+  shift
+  local message="$*"
+  local temporary="$STATUS_FILE.tmp.$$"
+  message="${message//$'\n'/ }"
+  message="${message//$'\r'/ }"
+  {
+    printf 'updated_epoch=%s\n' "$(date +%s)"
+    printf 'state=%s\n' "$state"
+    printf 'effective_upload_mode=%s\n' "$EFFECTIVE_UPLOAD_MODE"
+    printf 'server_upload_mode=%s\n' "$SERVER_UPLOAD_MODE"
+    printf 'message=%s\n' "$message"
+  } > "$temporary" && mv -f -- "$temporary" "$STATUS_FILE"
+}
+
+heartbeat() {
+  printf '%s\n' "$(date +%s)" > "$HEARTBEAT_FILE.tmp.$$" \
+    && mv -f -- "$HEARTBEAT_FILE.tmp.$$" "$HEARTBEAT_FILE"
+}
+
+root_is_readonly() {
+  local options
+  options="$($FINDMNT_BIN -n -o OPTIONS -T / 2>/dev/null)" || return 1
+  [[ ",$options," == *,ro,* ]]
+}
+
+make_root_writable() {
+  (( MANAGE_ROOT_MOUNT == 1 )) || return 0
+  # Liegen Auftraege und Laufzeitdateien im RAM, muss die SD-Karte fuer diese
+  # Arbeit nicht beschreibbar werden. Andere Speicherorte brauchen weiterhin
+  # das vorgesehene Schreibfenster (RW); danach wird wieder gesperrt (RO).
+  if [[ "$($FINDMNT_BIN -n -o FSTYPE -T "$SPOOL_ROOT" 2>/dev/null)" == tmpfs \
+      && "$($FINDMNT_BIN -n -o FSTYPE -T "$RUNTIME_ROOT" 2>/dev/null)" == tmpfs ]]; then
+    return 0
+  fi
+  if root_is_readonly; then
+    "$MOUNT_BIN" -o remount,rw / \
+      || { cr_fail "Root-Dateisystem kann nicht rw eingehangen werden"; return 1; }
+    ROOT_RW_OWNED=1
+    cr_log INFO "Root-Dateisystem fuer Kameraarbeit kurzzeitig rw"
+  fi
+}
+
+restore_root_readonly() {
+  (( ROOT_RW_OWNED == 1 )) || return 0
+  sync
+  if "$MOUNT_BIN" -o remount,ro /; then
+    ROOT_RW_OWNED=0
+    cr_log INFO "Root-Dateisystem wieder ro"
+    return 0
+  fi
+  # Manche Pis verweigern das uebliche Zurueckschalten von / auf RO, solange
+  # darunter RAM-Dateisysteme eingebunden sind (EBUSY = gerade belegt).
+  # Der zweite Versuch sperrt den Root-Mount gegen Schreiben, ohne die
+  # darunter eingebundenen RAM-Verzeichnisse umzubauen.
+  if "$MOUNT_BIN" -o remount,ro,bind /; then
+    ROOT_RW_OWNED=0
+    cr_log INFO "Root-Dateisystem per Bind-Remount wieder ro (EBUSY-Fallback)"
+    return 0
+  fi
+  ROOT_RESTORE_FAILED=1
+  cr_fail "KRITISCH: Root-Dateisystem konnte nicht wieder ro gesetzt werden"
+  write_status critical "Root-Dateisystem blieb nach Kameraarbeit schreibbar"
+  return 1
+}
+
+release_operation_lock() {
+  local result=0
+  restore_root_readonly || result=1
+  if [[ -n "$OPERATION_LOCK_FD" ]]; then
+    "$FLOCK_BIN" -u "$OPERATION_LOCK_FD" 2>/dev/null || true
+    exec {OPERATION_LOCK_FD}>&-
+    OPERATION_LOCK_FD=""
+  fi
+  return "$result"
+}
+
+cleanup() {
+  local original_result=$?
+  trap - EXIT HUP INT TERM
+  release_operation_lock || original_result=1
+  rm -f -- "$COMMAND_HEADER_FILE" "$UPLOAD_HEADER_FILE" \
+    "$COMMAND_FORM_FILE" "$COMMAND_RESPONSE_FILE" "$COMMAND_RESPONSE_HEADERS" \
+    "$UPLOAD_FORM_FILE" "$UPLOAD_RESPONSE_FILE" "$UPLOAD_CHUNK_FILE"
+  rm -f -- "$SERVER_RUNTIME_DIR/diagnostic.header" "$SERVER_RUNTIME_DIR/diagnostic.form" \
+    "$SERVER_RUNTIME_DIR/diagnostic.payload" "$SERVER_RUNTIME_DIR/diagnostic.response"
+  exit "$original_result"
+}
+
+# Diese Sperre verhindert versehentlich zwei Worker mit derselben
+# Serverkonfiguration. Unterschiedliche Server besitzen unterschiedliche
+# Sperrdateien und koennen daher parallel Befehle abfragen.
+exec {WORKER_LOCK_FD}>"$SERVER_RUNTIME_DIR/worker.lock"
+if ! "$FLOCK_BIN" -n "$WORKER_LOCK_FD"; then
+  cr_fail "Fuer diesen Server laeuft bereits ein Worker"
+  exit 1
+fi
+
+# Erst nach Erwerb der Worker-Sperre das Aufraeumen beim Beenden aktivieren.
+# Ein versehentlich doppelt gestarteter Worker darf keine Dateien der bereits
+# laufenden Instanz entfernen.
+trap cleanup EXIT HUP INT TERM
+
+# Diese zweite, globale Sperre schuetzt die eine physische Kamera und alle
+# Schreibfenster. Sie ist absichtlich fuer alle Server gleich.
+begin_operation() {
+  mkdir -p -- "$(dirname -- "$OPERATION_LOCK")" || return 1
+  exec {OPERATION_LOCK_FD}>"$OPERATION_LOCK"
+  if ! "$FLOCK_BIN" -w "$OPERATION_LOCK_TIMEOUT_SECONDS" "$OPERATION_LOCK_FD"; then
+    cr_fail "Zeitlimit beim Warten auf die gemeinsame Kamera-Sperre"
+    exec {OPERATION_LOCK_FD}>&-
+    OPERATION_LOCK_FD=""
+    return 1
+  fi
+  if ! make_root_writable; then
+    release_operation_lock || true
+    return 1
+  fi
+  mkdir -p -- "$SERVER_SPOOL_DIR/requests" "$SERVER_SPOOL_DIR/images" \
+    || { cr_fail "Spool-Verzeichnisse koennen nicht angelegt werden"; release_operation_lock || true; return 1; }
+  chmod 0700 "$SPOOL_ROOT" "$SERVER_SPOOL_DIR" \
+    "$SERVER_SPOOL_DIR/requests" "$SERVER_SPOOL_DIR/images" 2>/dev/null || true
+}
+
+curl_common_arguments() {
+  CURL_ARGUMENTS=(
+    --silent
+    --show-error
+    --connect-timeout "$CONNECT_TIMEOUT_SECONDS"
+    --proto '=http,https'
+  )
+  if [[ -n "$CA_CERT" ]]; then
+    CURL_ARGUMENTS+=(--cacert "$CA_CERT")
+  fi
+}
+
+# Der Zielserver darf nur dieses Enum uebersteuern, nie lokale Pfade oder Keys.
+# Nur der letzte HTTP-Headerblock zaehlt (z.B. nach 100 Continue).
+read_upload_mode() {
+  local mode
+  [[ -f "$COMMAND_RESPONSE_HEADERS" && $(wc -c < "$COMMAND_RESPONSE_HEADERS") -le 16384 ]] || return 1
+  mode="$(awk '
+    /^HTTP\// { mode="local"; count=0 }
+    tolower($0) ~ /^x-camera-upload-mode:/ {
+      count++; sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t\r]+$/, ""); mode=$0
+    }
+    END { if (count>1) exit 1; print mode }
+  ' "$COMMAND_RESPONSE_HEADERS")" || return 1
+  rm -f -- "$COMMAND_RESPONSE_HEADERS"
+  case "$mode" in local|legacy|chunked) ;; *) cr_fail "Ungueltige Upload-Vorgabe vom Server"; return 1 ;; esac
+  printf '%s\n' "$mode" > "$SERVER_RUNTIME_DIR/upload-mode.tmp.$$" \
+    && mv -f -- "$SERVER_RUNTIME_DIR/upload-mode.tmp.$$" "$SERVER_RUNTIME_DIR/upload-mode" || return 1
+  SERVER_UPLOAD_MODE="$mode"
+  EFFECTIVE_UPLOAD_MODE="$UPLOAD_MODE"
+  [[ "$mode" == local ]] || EFFECTIVE_UPLOAD_MODE="$mode"
+}
+
+# Authentifizierten Long-Poll ausfuehren; private Header/Formdateien nach curl
+# entfernen. Timeout 28 und leere 2xx-Antworten werden aktuell als wait behandelt;
+# das allein beweist weder Netzwerkerreichbarkeit noch einen gesunden Server.
+poll_command() {
+  local http_code
+  local curl_rc=0
+
+  # Alte PROD-Installationen erwarten den Schlüssel als Multipart-Feld
+  # `key`. Die private curl-Konfigurationsdatei hält ihn aus der Prozessliste.
+  cr_read_secret "$KEY_FILE" || return 1
+  (umask 077
+   printf 'form-string = "key=%s"\n' "$CR_SECRET" > "$COMMAND_FORM_FILE"
+  ) || {
+    unset CR_SECRET
+    cr_fail "Private Command-Formulardatei kann nicht geschrieben werden"
+    return 1
+  }
+  unset CR_SECRET
+
+  cr_write_header_file "X-Command-Key" "$KEY_FILE" "$COMMAND_HEADER_FILE" || {
+    rm -f -- "$COMMAND_FORM_FILE"
+    return 1
+  }
+  curl_common_arguments
+  set +e
+  local focus_protocol=none tunnel_protocol=none tunnel_state=unknown position_identity='' privacy_report=''
+  if [[ -r "$PRIVACY_HELPER" ]]; then
+    position_identity="$(/usr/bin/php "$PRIVACY_HELPER" identity "$SERVER_ID")" || position_identity=''
+    privacy_report="$(/usr/bin/php "$PRIVACY_HELPER" report)" || privacy_report=''
+  fi
+  if [[ "$COMMAND_URL" == https://* && -r "${TUNNEL_HELPER:-}" ]]; then
+    if tunnel_state="$(/usr/bin/python3 "$TUNNEL_HELPER" report "$SERVER_ID" 2>/dev/null)"; then
+      tunnel_protocol=camera-rpi-tunnel-v1
+    fi
+  fi
+  [[ "$CAPTURE_BACKEND" != gphoto2 ]] || focus_protocol=camera-rpi-focus-v1
+  http_code="$($CURL_BIN "${CURL_ARGUMENTS[@]}" \
+    --max-time "$COMMAND_TIMEOUT_SECONDS" \
+    --max-filesize 4096 \
+    --header "X-Camera-Focus-Protocol: $focus_protocol" \
+    --header "X-Camera-Tunnel-Protocol: $tunnel_protocol" \
+    --header "X-Camera-Tunnel-State: $tunnel_state" \
+    --header "X-Camera-Privacy: $privacy_report" \
+    --config "$COMMAND_FORM_FILE" \
+    --header "@$COMMAND_HEADER_FILE" \
+    --form-string "wc=$CAMERA_SLUG" \
+    --output "$COMMAND_RESPONSE_FILE" \
+    --dump-header "$COMMAND_RESPONSE_HEADERS" \
+    --write-out '%{http_code}' \
+    "$COMMAND_URL")" || {
+    curl_rc=$?
+  }
+  rm -f -- "$COMMAND_HEADER_FILE" "$COMMAND_FORM_FILE"
+
+  # Positionsangaben sind Zahlen, keine auszufuehrenden Befehle. Sie gehoeren
+  # genau zu dem zuvor abgefragten Zielserver und bleiben als Daten im RAM.
+  if (( curl_rc == 0 )) && [[ "$http_code" == 200 && -n "$position_identity" ]]; then
+    /usr/bin/php "$PRIVACY_HELPER" receive "$SERVER_ID" "$COMMAND_RESPONSE_HEADERS" "$position_identity" \
+      || cr_log WARNING 'Kamerastandort konnte nicht übernommen werden'
+  fi
+
+  # Der alte PROD-Endpunkt verwendet Long-Polling. Wenn innerhalb des
+  # Command-Timeouts kein Auftrag vorliegt, beendet curl mit 28 ohne Body.
+  # Das ist dort ein normaler Wartezustand, kein Fehler.
+  if (( curl_rc == 28 )); then
+    printf 'wait\n0\nwait\n' > "$COMMAND_RESPONSE_FILE"
+    rm -f -- "$COMMAND_RESPONSE_HEADERS"
+    SERVER_UPLOAD_MODE=local
+    EFFECTIVE_UPLOAD_MODE="$UPLOAD_MODE"
+    return 0
+  fi
+
+  if (( curl_rc != 0 )); then
+    rm -f -- "$COMMAND_RESPONSE_FILE"
+    cr_fail "Befehlsabfrage ist technisch fehlgeschlagen"
+    return 1
+  fi
+
+  # Einige Legacy-Installationen beenden den Long-Poll mit HTTP 200 und
+  # leerem Body statt mit curl-Timeout.
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]] \
+      && { [[ ! -s "$COMMAND_RESPONSE_FILE" ]] \
+           || ! grep -q '[^[:space:]]' "$COMMAND_RESPONSE_FILE"; }; then
+    printf 'wait\n0\nwait\n' > "$COMMAND_RESPONSE_FILE"
+    rm -f -- "$COMMAND_RESPONSE_HEADERS"
+    SERVER_UPLOAD_MODE=local
+    EFFECTIVE_UPLOAD_MODE="$UPLOAD_MODE"
+    return 0
+  fi
+
+  [[ "$http_code" =~ ^2[0-9][0-9]$ ]] \
+    || { rm -f -- "$COMMAND_RESPONSE_FILE"; cr_fail "Befehlsabfrage lieferte HTTP $http_code"; return 1; }
+  if [[ "$tunnel_protocol" == camera-rpi-tunnel-v1 ]]; then
+    /usr/bin/python3 "$TUNNEL_HELPER" receive "$SERVER_ID" "$COMMAND_RESPONSE_HEADERS" \
+      || cr_log WARNING "Wartungsfreigabe ungueltig; Tunnel wird geschlossen"
+  fi
+  read_upload_mode
+}
+
+# Moderne Capture-/Wait- und Fokusvertraege zuerst auswerten. Der historische
+# Adapter erkennt zusaetzlich capture-command/webcam_capture in einzelnen Zeilen
+# und vergibt dann die lokale Epoch-Zeit. Antworttext wird niemals als Shell
+# ausgefuehrt; die Legacy-Erkennung ist bewusst breiter als der Fokusvertrag.
+parse_command() {
+  local -a lines=()
+  local legacy_stamp last
+  POLLED_LEGACY_NOTICE=''
+  POLLED_LEGACY_STAMP=''
+  # Steuerzeichen vor dem Einlesen ablehnen. Bash wuerde Nullbytes sonst
+  # verschlucken; dadurch koennte eine ungueltige Antwort gueltig aussehen.
+  [[ -f "$COMMAND_RESPONSE_FILE" ]] || { cr_fail "Serverantwort fehlt"; return 1; }
+  if [[ "$(LC_ALL=C tr -d '\11\12\15\40-\176' < "$COMMAND_RESPONSE_FILE" | wc -c)" -ne 0 ]]; then
+    rm -f -- "$COMMAND_RESPONSE_FILE"
+    cr_fail "Serverantwort enthaelt ungueltige Steuerzeichen"
+    return 1
+  fi
+  mapfile -t lines < "$COMMAND_RESPONSE_FILE"
+  rm -f -- "$COMMAND_RESPONSE_FILE"
+
+  # Fokusbefehle haben ein eigenes, streng geprueftes Antwortformat. Auch ein
+  # fehlerhafter Fokusauftrag darf nicht als alter Aufnahmebefehl gelten.
+  if [[ "${lines[0]:-}" == focus || "${lines[0]:-}" == $'focus\r' ]]; then
+    ((${#lines[@]} == 3)) || { cr_fail "Ungueltiger Fokusvertrag"; return 1; }
+    POLLED_SERIAL="${lines[1]%$'\r'}"
+    POLLED_FOCUS_MODE="${lines[2]%$'\r'}"
+    [[ "$CAPTURE_BACKEND" == gphoto2 && "$POLLED_SERIAL" =~ ^[0-9]{10}$ ]] \
+      && cr_focus_mode_valid "$POLLED_FOCUS_MODE" || { cr_fail "Fokus nicht unterstuetzt oder ungueltig"; return 1; }
+    POLLED_COMMAND=focus
+    return 0
+  fi
+
+  # Der alte Server fuegt hinter command.txt noch einen Zeilenumbruch an.
+  # Deshalb nur leere Schlusszeilen entfernen. Leere Zeilen im Inneren und
+  # Zeilen mit Leerzeichen bleiben fuer die Formatpruefung erhalten.
+  while ((${#lines[@]} > 0)); do
+    last=$((${#lines[@]} - 1))
+    [[ -z "${lines[$last]%$'\r'}" ]] || break
+    unset 'lines[last]'
+  done
+
+  # Bei einer mehrzeiligen Befehlsantwort alle Felder gemeinsam pruefen.
+  # Ein fehlerhaftes Feld darf nicht durch die grosszuegigere Alt-Erkennung
+  # umgangen werden. Auftragsnummer und Kalenderzeit des Servers erhalten.
+  if [[ "${lines[0]:-}" == command || "${lines[0]:-}" == $'command\r' ]]; then
+    ((${#lines[@]} == 3)) || { cr_fail "Serverantwort hat nicht genau drei Zeilen"; return 1; }
+    POLLED_SERIAL="${lines[1]%$'\r'}"
+    [[ "$POLLED_SERIAL" =~ ^[0-9]{10}$ ]] || { cr_fail "Befehls-Zeitstempel ist ungueltig"; return 1; }
+    local command_line="${lines[2]%$'\r'}"
+    if [[ "$command_line" =~ ^webcam_capture([[:blank:]]+([0-9]{8}_[0-9]{4}))?$ ]]; then
+      POLLED_LEGACY_STAMP="${BASH_REMATCH[2]:-}"
+      [[ -z "$POLLED_LEGACY_STAMP" ]] || POLLED_LEGACY_STAMP="$(legacy_capture_slot_stamp "$POLLED_LEGACY_STAMP")" \
+        || { cr_fail "Legacy-Aufnahmezeit ist ungueltig"; return 1; }
+      POLLED_COMMAND=capture
+      return 0
+    fi
+    if legacy_isoexp_line_is_valid "$command_line"; then
+      POLLED_COMMAND=unsupported-isoexp
+      [[ "$CAPTURE_BACKEND" != gphoto2 || "${GPHOTO_CAPTURE_MODE:-eos-legacy}" != eos-legacy ]] \
+        || POLLED_COMMAND=isoexp
+      POLLED_LEGACY_NOTICE="$command_line"
+      return 0
+    fi
+    cr_fail "Serverantwort enthaelt keinen erlaubten Befehl"
+    return 1
+  fi
+
+  # Alte PROD-Installationen liefern beim fälligen Slot statt des neuen
+  # Drei-Zeilen-Vertrags eine Statuszeile, gelegentlich mit Leer-/Zusatzzeilen.
+  local legacy_line
+  for legacy_line in "${lines[@]}"; do
+    legacy_line="${legacy_line%$'\r'}"
+    if [[ "$legacy_line" =~ capture-command ]]; then
+      if [[ "$legacy_line" =~ stamp=([0-9]{8})_([0-9]{4}) ]]; then
+        legacy_stamp="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
+        POLLED_LEGACY_STAMP="$(legacy_capture_slot_stamp "$legacy_stamp")" || return 1
+      else
+        legacy_stamp="unknown"
+      fi
+      POLLED_COMMAND="capture"
+      POLLED_SERIAL="$(date +%s)"
+      cr_log INFO "Legacy-Capture-Auftrag empfangen ($legacy_stamp)"
+      return 0
+    fi
+    if [[ "$legacy_line" =~ webcam_capture ]]; then
+      if [[ "$legacy_line" =~ webcam_capture[[:blank:]]+([0-9]{8}_[0-9]{4}) ]]; then
+        POLLED_LEGACY_STAMP="${BASH_REMATCH[1]}"
+        POLLED_LEGACY_STAMP="$(legacy_capture_slot_stamp "$POLLED_LEGACY_STAMP")" || return 1
+      fi
+      POLLED_COMMAND="capture"
+      POLLED_SERIAL="$(date +%s)"
+      cr_log INFO "Legacy-Capture-Auftrag empfangen (webcam_capture)"
+      return 0
+    fi
+  done
+
+  ((${#lines[@]} == 3)) || { cr_fail "Serverantwort hat nicht genau drei Zeilen"; return 1; }
+  lines[0]="${lines[0]%$'\r'}"
+  lines[1]="${lines[1]%$'\r'}"
+  lines[2]="${lines[2]%$'\r'}"
+  [[ "${lines[0]}" == "command" && "${lines[2]}" == "webcam_capture" ]] \
+    || {
+      [[ "${lines[0]}" == "wait" && "${lines[2]}" == "wait" \
+          && ( "${lines[1]}" == "0" || "${lines[1]}" == "wait" ) ]] \
+        && { POLLED_COMMAND="wait"; POLLED_SERIAL=""; return 0; }
+      cr_fail "Serverantwort enthaelt keinen erlaubten Befehl"
+      return 1
+    }
+  [[ "${lines[1]}" =~ ^[0-9]{10}$ ]] \
+    || { cr_fail "Capture-Zeitstempel ist ungueltig"; return 1; }
+  POLLED_COMMAND="capture"
+  POLLED_SERIAL="${lines[1]}"
+}
+
+serial_is_current() {
+  local serial="$1"
+  local now
+  local age
+  now="$(date +%s)"
+  age=$((now - 10#$serial))
+  (( age <= MAX_COMMAND_AGE_SECONDS && age >= -MAX_COMMAND_FUTURE_SECONDS ))
+}
+
+# Der alte Server erwartet eine Kalenderzeit wie 20261017_1200. Sie ist
+# getrennt von der numerischen Auftragsnummer (Sekunden seit 01.01.1970).
+# Keine zweite Zeitzonenumrechnung: Die Serverzeit und sein Aufnahmeversatz
+# stecken bereits in diesem uebermittelten Text.
+legacy_capture_stamp_is_valid() {
+  local stamp="$1" normalized
+  [[ "$stamp" =~ ^[0-9]{8}_[0-9]{4}$ ]] || return 1
+  normalized="$(TZ=UTC LC_ALL=C date -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:00" +%Y%m%d_%H%M 2>/dev/null)" || return 1
+  [[ "$normalized" == "$stamp" ]]
+}
+
+# Betreiberregel fuer automatische Alt-Auftraege: 21:58 wird zu 21:50.
+# Gerundet wird die mitgelieferte Server-Kalenderzeit, nicht die Pi-Uhr.
+# Auftragsnummern und ausdruecklich manuelle Aufnahmen bleiben ungerundet.
+legacy_capture_slot_stamp() {
+  local stamp="$1"
+  legacy_capture_stamp_is_valid "$stamp" || return 1
+  printf '%s%d0' "${stamp:0:11}" "$((10#${stamp:11:2} / 10))"
+}
+
+# Eine Auftragsdatei ist hoechstens 64 Byte lang und wird nur als Daten gelesen.
+# Neben 'capture' kann sie die alte Kalenderzeit und die vor der Serverabfrage
+# bekannte Pool-Aufnahme enthalten. 'private' bezeichnet eine manuelle Aufnahme
+# nur fuer dieses Ziel. Diese Angaben verhindern unnoetige Doppelaufnahmen.
+# Die geprueften Ergebnisse stehen in REQUEST_LEGACY_STAMP, REQUEST_POOL_SLOT
+# und REQUEST_PRIVATE; alte Werte werden zu Beginn zurueckgesetzt.
+read_capture_request_stamp() {
+  local path="$1"
+  local -a fields=()
+  REQUEST_LEGACY_STAMP=''
+  REQUEST_POOL_SLOT=''
+  REQUEST_PRIVATE=0
+  [[ -f "$path" && ! -L "$path" && "$(stat -c %s -- "$path")" -le 64 ]] || return 1
+  [[ "$(LC_ALL=C tr -d '\12\40-\176' < "$path" | wc -c)" -eq 0 ]] || return 1
+  mapfile -t fields < "$path"
+  if (( ${#fields[@]} >= 2 )) && [[ "${fields[-1]}" == private ]]; then
+    REQUEST_PRIVATE=1
+    unset 'fields[-1]'
+  fi
+  if (( ${#fields[@]} >= 2 )) && [[ "${fields[-1]}" == pool=* ]]; then
+    REQUEST_POOL_SLOT="${fields[-1]#pool=}"
+    [[ "$REQUEST_POOL_SLOT" == 0 || "$REQUEST_POOL_SLOT" =~ ^[0-9]{10}$ ]] || return 1
+    unset 'fields[-1]'
+  fi
+  (( ${#fields[@]} == 1 || ${#fields[@]} == 2 )) && [[ "${fields[0]}" == capture ]] || return 1
+  if (( ${#fields[@]} == 2 )); then
+    legacy_capture_stamp_is_valid "${fields[1]}" || return 1
+    REQUEST_LEGACY_STAMP="${fields[1]}"
+  fi
+}
+
+# Auftrag zuerst im Zielspool vormerken; bei belegter globaler Sperre bleibt ein
+# RAM-Marker fuer den naechsten Durchlauf. Kein anderer Zielserver wird veraendert.
+# Argumente: Auftragsnummer, optionale Kalenderzeit und Pool-Zuordnung
+# (zuletzt beobachtete gemeinsame Aufnahme oder 'private' fuer manuell).
+# Beim Uebernehmen eines wartenden Auftrags alle drei erhalten, sonst koennte
+# ein spaeterer Versuch nochmals ausloesen statt das gemeinsame Foto zu nutzen.
+queue_request() {
+  local serial="$1"
+  local legacy_stamp="${2:-}" payload=capture
+  local pool_slot="${3:-}"
+  if [[ -n "$legacy_stamp" ]]; then
+    legacy_capture_stamp_is_valid "$legacy_stamp" || return 1
+    payload+=$'\n'"$legacy_stamp"
+  fi
+  if [[ "$pool_slot" == private ]]; then
+    payload+=$'\nprivate'
+  elif [[ -n "$pool_slot" ]]; then
+    [[ "$pool_slot" == 0 || "$pool_slot" =~ ^[0-9]{10}$ ]] || return 1
+    payload+=$'\n'"pool=$pool_slot"
+  fi
+  local target="$SERVER_SPOOL_DIR/requests/$serial.request"
+  local temporary="$target.tmp.$$"
+  local runtime_marker="$SERVER_RUNTIME_DIR/$serial.pending"
+
+  # Noch bevor der Worker auf Kamera/Root wartet, merkt er sich den bereits
+  # serverseitig verbrauchten Command im beschreibbaren /run. Schlaegt das
+  # Mounten oder Lock-Warten fehl, wird genau dieser Auftrag im naechsten
+  # Durchlauf erneut in den Zielspool uebertragen statt vergessen.
+  # Auch dieser Spool kann im RAM liegen: "dauerhaft vorgemerkt" im Log
+  # bedeutet dann ueber Worker-Neustarts hinweg, nicht ueber Pi-Neustarts.
+  printf '%s\n' "$payload" > "$runtime_marker.tmp.$$" \
+    && mv -f -- "$runtime_marker.tmp.$$" "$runtime_marker" \
+    || { cr_fail "Capture-Auftrag kann nicht temporaer vorgemerkt werden"; return 1; }
+
+  begin_operation || return 1
+  if [[ ! -e "$target" && ! -e "$SERVER_SPOOL_DIR/images/$serial.jpg" ]]; then
+    printf '%s\n' "$payload" > "$temporary" && mv -f -- "$temporary" "$target" \
+      || { cr_fail "Capture-Auftrag kann nicht sicher gespeichert werden"; release_operation_lock || true; return 1; }
+    cr_log INFO "Capture-Auftrag $serial dauerhaft vorgemerkt"
+  fi
+  rm -f -- "$runtime_marker"
+  release_operation_lock
+}
+
+oldest_file() {
+  local directory="$1"
+  local suffix="$2"
+  local path
+  local chosen=""
+
+  shopt -s nullglob
+  for path in "$directory"/*"$suffix"; do
+    [[ -z "$chosen" || "$path" < "$chosen" ]] && chosen="$path"
+  done
+  shopt -u nullglob
+  printf '%s' "$chosen"
+}
+
+# Den beim letzten Sperrkonflikt behaltenen RAM-Auftrag in den Zielspool uebernehmen.
+promote_runtime_request() {
+  local marker
+  local serial
+  marker="$(oldest_file "$SERVER_RUNTIME_DIR" .pending)"
+  [[ -n "$marker" ]] || return 0
+  serial="$(basename -- "$marker" .pending)"
+  [[ "$serial" =~ ^[0-9]{10}$ ]] \
+    || { cr_fail "Ungueltiger temporaerer Capture-Auftrag"; return 1; }
+  read_capture_request_stamp "$marker" || { cr_fail "Ungueltige temporaere Aufnahmezeit"; return 1; }
+  local origin="$REQUEST_POOL_SLOT"
+  (( REQUEST_PRIVATE == 0 )) || origin=private
+  queue_request "$serial" "$REQUEST_LEGACY_STAMP" "$origin"
+}
+
+# Schneller Dateivorcheck; erst decoded_jpeg prueft den gesamten Bildinhalt.
+valid_jpeg() {
+  local image="$1"
+  local size
+  local first_bytes
+  local last_bytes
+  size="$(stat -c '%s' "$image" 2>/dev/null)" || return 1
+  (( size >= MIN_IMAGE_BYTES && size <= MAX_IMAGE_BYTES )) || return 1
+  first_bytes="$(head -c 2 "$image" | od -An -tx1 | tr -d ' \n')"
+  last_bytes="$(tail -c 2 "$image" | od -An -tx1 | tr -d ' \n')"
+  [[ "$first_bytes" == "ffd8" && "$last_bytes" == "ffd9" ]]
+}
+
+# Dateigroesse und JPEG-Anfang/-Ende allein beweisen kein brauchbares Bild.
+# Deshalb das gesamte JPEG probeweise mit GD lesen, vor Pool-Verteilung und
+# auch vor dem Versand alter Spooldateien. Zeit und PHP-Speicher sind begrenzt.
+# Rueckgabe: 0 = lesbar, 1 = unbrauchbares Bild, 2 = Pruefung nicht moeglich
+# (z.B. Werkzeugfehler oder Zeitlimit). Fall 2 darf keine Quarantaene ausloesen.
+decoded_jpeg() {
+  local rc=0
+  /usr/bin/timeout --kill-after=2 15 /usr/bin/php -d memory_limit=256M \
+    "$CR_SOURCE_HELPER" validate-jpeg "$1" || rc=$?
+  (( rc <= 1 )) || return 2
+  return "$rc"
+}
+
+# Ein unlesbares Bild oder ein vom Server exakt bestaetigter Slotkonflikt
+# darf die Versandliste nicht dauerhaft blockieren. Das Bild samt Begleitdateien
+# wandert in die Quarantaene;
+# hoechstens drei solcher Bilder je Ziel bleiben zur Fehlersuche erhalten.
+# Das ist keine Serverbestaetigung. Andere Ziele behalten ihre eigenen Verweise.
+# Vorher muss die Upload-Lesesperre frei sein, damit die gemeinsame
+# Kamerasperre ohne gegenseitiges Warten uebernommen werden kann.
+quarantine_image() {
+  local image="$1" reason="${2:-invalid_image}" serial="${1##*/}" dir="$SERVER_SPOOL_DIR/quarantine" result=0 old
+  serial="${serial%.jpg}"
+  begin_operation || return 1
+  if mkdir -p -- "$dir" && mv -- "$image" "$dir/$serial.jpg"; then
+    for old in "$image.weather.json" "$image.legacy-stamp" "$image.captured"; do
+      [[ ! -f "$old" ]] || mv -- "$old" "$dir/${old##*/}" || result=1
+    done
+    if (( POOL_ENABLED )); then cr_pool_acknowledge "$serial" || result=1; fi
+    # Drei ausgesonderte Bilder je Ziel fuer die Diagnose behalten; separates Limit.
+    while (( $(find "$dir" -maxdepth 1 -name '*.jpg' -type f | wc -l) > 3 )); do
+      old="$(oldest_file "$dir" .jpg)"
+      rm -f -- "$old" "$old.weather.json" "$old.legacy-stamp" "$old.captured" || { result=1; break; }
+    done
+    if [[ "$reason" == immutable_slot_conflict ]]; then
+      cr_log ERROR "Bild $serial wegen bestaetigtem Slotkonflikt in Quarantaene $dir/$serial.jpg; kein Upload-ACK, neuere Bilder werden weiter gesendet"
+    else
+      cr_log ERROR "Bild $serial ist nicht dekodierbar; Quarantaene $dir/$serial.jpg, kein Upload-ACK"
+    fi
+  else result=1; fi
+  release_operation_lock || result=1
+  return "$result"
+}
+
+# Die erfolgreich aufgenommene Spooldatei wird zusaetzlich atomar nach /run
+# kopiert. Diese Kopie ist nur fuer die lokale Statusseite bestimmt und darf
+# den eigentlichen Capture-/Uploadablauf bei einem Darstellungsfehler niemals
+# gefaehrden. /run liegt im RAM; dadurch entstehen keine dauernden SD-Schreibzugriffe.
+publish_latest_capture() {
+  local image="$1"
+  local requested_epoch="$2"
+  local captured_epoch="$3"
+  local image_temporary="$STATUS_PUBLISH_ROOT/latest.jpg.tmp.$$"
+  local meta_temporary="$STATUS_PUBLISH_ROOT/latest.status.tmp.$$"
+
+  mkdir -p -- "$STATUS_PUBLISH_ROOT" || return 1
+  chmod 0750 "$STATUS_PUBLISH_ROOT" 2>/dev/null || true
+  if [[ -n "$STATUS_PUBLISH_GROUP" ]] \
+      && getent group "$STATUS_PUBLISH_GROUP" >/dev/null 2>&1; then
+    chgrp "$STATUS_PUBLISH_GROUP" "$STATUS_PUBLISH_ROOT" 2>/dev/null || true
+  fi
+  cp -- "$image" "$image_temporary" || return 1
+  {
+    printf 'captured_epoch=%s\n' "$captured_epoch"
+    printf 'requested_epoch=%s\n' "$requested_epoch"
+    printf 'server_id=%s\n' "$SERVER_ID"
+    printf 'camera_slug=%s\n' "$CAMERA_SLUG"
+  } > "$meta_temporary" || { rm -f -- "$image_temporary" "$meta_temporary"; return 1; }
+  chmod 0640 "$image_temporary" "$meta_temporary" 2>/dev/null || true
+  if [[ -n "$STATUS_PUBLISH_GROUP" ]]; then
+    chgrp "$STATUS_PUBLISH_GROUP" "$image_temporary" "$meta_temporary" 2>/dev/null || true
+  fi
+  mv -f -- "$image_temporary" "$STATUS_PUBLISH_ROOT/latest.jpg" \
+    && mv -f -- "$meta_temporary" "$STATUS_PUBLISH_ROOT/latest.status"
+}
+
+# Letzten fehlgeschlagenen Versuch privat im RAM behalten, auch wenn danach
+# erneut aufgenommen oder erfolgreich hochgeladen wird. Zeit/Auftrag verhindern
+# die Verwechslung mit einem aktuellen Fehler. Maximal 64 KiB, keine Curl- oder
+# Key-Dateien; nur die bereits separat umgeleitete Ausgabe der Aufnahme.
+save_capture_failure() {
+  local output="$1" serial="$2" backend_exit="$3"
+  local diagnostic="$SERVER_RUNTIME_DIR/capture.last-error"
+  local temporary="$diagnostic.tmp.$$"
+  {
+    printf 'updated_epoch=%s\nrequest=%s\nbackend_exit=%s\n' "$(date +%s)" "$serial" "$backend_exit"
+    tail -c 65280 -- "$output"
+  } > "$temporary" && chmod 0600 "$temporary" && mv -f -- "$temporary" "$diagnostic" \
+    || { rm -f -- "$temporary"; return 1; }
+  # Eine fehlgeschlagene gemeinsame Aufnahme betrifft alle Ziele. Deshalb
+  # den Fehler einmal vollstaendig im RAM bereitstellen. Spaeter sendet jeder
+  # Worker ihn mit seinem eigenen Schluessel; dabei bleibt die Kamera frei.
+  if (( ${POOL_ENABLED:-0} )); then
+    cp -- "$diagnostic" "$RUNTIME_ROOT/capture.last-error.tmp.$$" \
+      && mv -f -- "$RUNTIME_ROOT/capture.last-error.tmp.$$" "$RUNTIME_ROOT/capture.last-error" \
+      || return 1
+  fi
+  cr_log WARNING "Aufnahmedetails bleiben in $diagnostic"
+}
+
+# Aufnahmefehler ueber den vorhandenen Log-Endpunkt melden, unabhaengig vom
+# Bildversand. Der letzte Fehler bleibt lokal auch nach spaeterem Erfolg lesbar.
+# Je Ziel merkt sich der Worker den bestaetigten Fehler, um ihn nicht dauernd
+# erneut zu senden. Hoechstens ein Sendeversuch je fuenf Minuten.
+# Eine bestaetigte Fehlermeldung ist KEIN Nachweis fuer ein hochgeladenes Bild.
+# Keine Kamerasperre, kein SD-Schreibfenster; Schluessel bleiben in Privatdateien.
+report_capture_failure() {
+  local diagnostic="$SERVER_RUNTIME_DIR/capture.last-error" now previous=0 fingerprint ack='' serial http_code
+  local payload="$SERVER_RUNTIME_DIR/diagnostic.payload" header="$SERVER_RUNTIME_DIR/diagnostic.header"
+  local form="$SERVER_RUNTIME_DIR/diagnostic.form" response="$SERVER_RUNTIME_DIR/diagnostic.response"
+  (( ${POOL_ENABLED:-0} == 0 )) || diagnostic="$RUNTIME_ROOT/capture.last-error"
+  [[ -s "$diagnostic" ]] || return 0
+  now="$(date +%s)"
+  [[ ! -r "$SERVER_RUNTIME_DIR/diagnostic.attempt" ]] || read -r previous < "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+  [[ "$previous" =~ ^[0-9]{1,10}$ ]] || previous=0
+  (( now < previous || now - previous >= 300 )) || return 0
+  # Einen vollstaendigen Fehlerstand lesen und geheime URL-/Zugangsdaten vor
+  # dem Versand entfernen. Der Schluessel erscheint nicht in der Prozessliste.
+  /usr/bin/python3 - "$diagnostic" "$KEY_FILE" "$payload" <<'PY' || return 1
+import pathlib, re, sys
+with open(sys.argv[1], 'rb') as source:
+    raw = source.read(65536)
+text = raw.decode('utf-8', errors='replace')
+key = pathlib.Path(sys.argv[2]).read_text().strip()
+if key:
+    text = text.replace(key, '[REDACTED]')
+text = re.sub(r'\b(?:https?|rtsps?|ftp)://[^\s<>]+', '[URL REDACTED]', text, flags=re.I)
+text = re.sub(r'(?im)^.*(?:authorization|cookie|password|passwd|secret|token|api[_-]?key|upload[_-]?key)\s*[:=].*$', '[CREDENTIAL REDACTED]', text)
+text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+pathlib.Path(sys.argv[3]).write_bytes(text.encode('utf-8')[:65536])
+PY
+  fingerprint="$("$SHA256SUM_BIN" "$payload")" || return 1
+  fingerprint="${fingerprint%% *}"
+  [[ ! -r "$SERVER_RUNTIME_DIR/diagnostic.ack" ]] || read -r ack < "$SERVER_RUNTIME_DIR/diagnostic.ack"
+  if [[ "$ack" == "$fingerprint" ]]; then rm -f -- "$payload"; return 0; fi
+  serial="$(sed -n 's/^request=\([0-9]\{10\}\)$/\1/p' "$payload" | head -n 1)"
+  [[ "$serial" =~ ^[0-9]{10}$ ]] || { rm -f -- "$payload"; return 1; }
+  cr_read_secret "$KEY_FILE" || { rm -f -- "$payload"; return 1; }
+  if ! printf 'form-string = "key=%s"\n' "$CR_SECRET" > "$form"; then
+    unset CR_SECRET
+    rm -f -- "$payload" "$form"
+    return 1
+  fi
+  unset CR_SECRET
+  cr_write_header_file X-Upload-Key "$KEY_FILE" "$header" || { rm -f -- "$payload" "$form"; return 1; }
+  printf '%s\n' "$now" > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+  curl_common_arguments
+  http_code="$($CURL_BIN "${CURL_ARGUMENTS[@]}" --connect-timeout 3 --max-time 8 \
+    --max-filesize 4096 --header "@$header" --config "$form" \
+    --form-string "wc=$CAMERA_SLUG" --form-string "serial=$serial" \
+    --form "log=@$payload;type=text/plain;filename=capture-error.txt" \
+    --output "$response" --write-out '%{http_code}' "$SERVER_BASE_URL/include/log.php")" || http_code=000
+  # Foto-Webcam bestaetigt mit "log ok (<serial>).". Die ganze Antwort UND
+  # die Auftragsnummer muessen passen. HTTP200 allein reicht nicht.
+  # Das bestaetigt den Protokollaustausch, nicht die dauerhafte Ablage auf Disk.
+  if [[ "$http_code" == 200 && -f "$response" ]] \
+      && { cmp -s "$response" <(printf 'ok\n') || cmp -s "$response" <(printf ok) \
+        || cmp -s "$response" <(printf 'log ok (%s).\n' "$serial") \
+        || cmp -s "$response" <(printf 'log ok (%s).' "$serial"); }; then
+    printf '%s\n' "$fingerprint" > "$SERVER_RUNTIME_DIR/diagnostic.ack"
+    cr_log INFO "Aufnahmefehler $serial vom Server als Log bestaetigt"
+  else
+    cr_log WARNING "Fehlerprotokoll nicht bestaetigt (HTTP $http_code); erneuter Versuch fruehestens in 5 Minuten"
+  fi
+  rm -f -- "$payload" "$header" "$form" "$response"
+  return 0
+}
+
+# Aufnahme/JPEG-Pruefung und optionalen Wetter-Snapshot unter Kamerasperre halten.
+# Erst eine fertige Bilddatei ersetzt den Auftrag; die lokale Vorschau ist separat.
+capture_one_request() {
+  local request="$1"
+  local serial
+  local image
+  local partial
+  local output
+  local captured_epoch
+  local legacy_stamp
+  local result=0
+  local backend_exit=0
+
+  serial="$(basename -- "$request" .request)"
+  [[ "$serial" =~ ^[0-9]{10}$ ]] \
+    || { cr_fail "Ungueltiger Auftrag im Spool: $request"; return 1; }
+  image="$SERVER_SPOOL_DIR/images/$serial.jpg"
+  partial="$SERVER_SPOOL_DIR/images/$serial.jpg.part"
+  output="$SERVER_RUNTIME_DIR/capture.output"
+
+  begin_operation || return 1
+  if [[ -f "$image" ]]; then
+    rm -f -- "$request"
+    release_operation_lock
+    return $?
+  fi
+
+  if ! read_capture_request_stamp "$request"; then
+    cr_fail "Ungueltige Auftragsmetadaten: $serial"
+    release_operation_lock || true
+    return 1
+  fi
+  legacy_stamp="$REQUEST_LEGACY_STAMP"
+  # Die Pi-Zeit nach abgeschlossener Aufnahme/Pruefung vor dem fertigen JPEG
+  # bereitstellen. Sie ist kein exakt gemessener Verschlusszeitpunkt.
+  # Ein spaeterer Versandversuch muss diese Zeit behalten, nicht seine Sendezeit.
+  # Die Begleitdatei bleibt bis zur Bestaetigung neben dem Bild erhalten.
+  if [[ -n "$legacy_stamp" ]]; then
+    if ! { printf '%s\n' "$legacy_stamp" > "$image.legacy-stamp.tmp.$$" \
+      && mv -f -- "$image.legacy-stamp.tmp.$$" "$image.legacy-stamp"; }; then
+      cr_fail "Legacy-Aufnahmezeit konnte nicht gespeichert werden"
+      release_operation_lock || true
+      return 1
+    fi
+  fi
+
+  # Alte wartende Auftraege haben noch keine Kennzeichnung ihrer Pool-Zugehoerigkeit.
+  # Sie nutzen nach der Umstellung die erste gemeinsame Aufnahme. Neue, gezielt
+  # manuelle Auftraege bleiben dagegen auf ihr einzelnes Ziel beschraenkt.
+  if (( ${POOL_ENABLED:-0} == 1 && ${REQUEST_PRIVATE:-0} == 0 )) && [[ -z "${REQUEST_POOL_SLOT:-}" ]]; then
+    REQUEST_POOL_SLOT=0
+  fi
+  if [[ -n "${REQUEST_POOL_SLOT:-}" ]]; then
+    # Pool lookup and first capture happen inside the SAME camera lock.
+    # Upload acknowledgments later unlink only this target's hardlink.
+    if (( ${POOL_ENABLED:-0} != 1 )); then
+      cr_fail 'Poolauftrag vorhanden, aber gemeinsamer Pool ist deaktiviert'
+      release_operation_lock || true
+      return 1
+    fi
+    cr_pool_capture_locked "$REQUEST_POOL_SLOT" "$serial" "$image" "$output" \
+      && rm -f -- "$request" || result=1
+    release_operation_lock || result=1
+    return "$result"
+  fi
+
+  rm -f -- "$partial" "$output"
+  local CR_CAPTURE_ATTEMPT_MARKER="$output.attempted" capture_valid=0
+  rm -f -- "$CR_CAPTURE_ATTEMPT_MARKER" || { release_operation_lock; return 1; }
+  write_status capturing "Kamera nimmt Bild $serial auf"
+  cr_log INFO "Kameraaufnahme $serial beginnt"
+  if cr_capture_to_file "$partial" >"$output" 2>&1; then
+    if valid_jpeg "$partial" && decoded_jpeg "$partial"; then
+      capture_valid=1
+      cr_capture_recovery ok || true
+      captured_epoch="$(date +%s)"
+      if [[ -r "$WEATHER_HELPER" ]]; then
+        /usr/bin/python3 "$WEATHER_HELPER" snapshot "$STATUS_PUBLISH_ROOT/current.status" "$image.weather.json" "$captured_epoch" \
+          || cr_log WARNING "Lokale Wetterdaten fuer Bild $serial nicht uebernommen"
+      fi
+      if printf '%s\n' "$captured_epoch" > "$image.captured.tmp.$$" \
+          && mv -f -- "$image.captured.tmp.$$" "$image.captured" \
+          && mv -f -- "$partial" "$image" && rm -f -- "$request"; then
+        if ! publish_latest_capture "$image" "$serial" "$captured_epoch"; then
+          cr_log WARNING "Lokale Statuskopie fuer Bild $serial konnte nicht aktualisiert werden"
+        fi
+      else
+        result=1
+      fi
+    else
+      cr_fail "Kamera lieferte keine gueltige JPEG-Datei"
+      result=1
+    fi
+  else
+    backend_exit=$?
+    if (( backend_exit == 3 )); then
+      cr_capture_recovery ok || true
+      privacy_capture_skipped "$serial" "$output"
+      rm -f -- "$request" "$partial" "$image.legacy-stamp" "$output"
+      release_operation_lock
+      return $?
+    fi
+    cr_fail "$CAPTURE_BACKEND-Aufnahme ist fehlgeschlagen oder abgelaufen"
+    result=1
+  fi
+  if (( result != 0 )); then
+    (( capture_valid )) || cr_capture_recovery failed >> "$output" 2>&1 || true
+    save_capture_failure "$output" "$serial" "$backend_exit" \
+      || cr_log WARNING "Aufnahmedetails konnten nicht gesichert werden"
+  fi
+  rm -f -- "$partial" "$output"
+  release_operation_lock || result=1
+  (( result == 0 )) && cr_log INFO "Kameraaufnahme $serial sicher im Spool"
+  return "$result"
+}
+
+# Der Aufnahmeschutz kann ein Bild bewusst verwerfen. Der Auftrag ist dann
+# ohne Bild erledigt, kein Kamerafehler. Nur die kurze Begruendung im RAM
+# behalten; das gesperrte Bild weder speichern noch erneut ausliefern.
+privacy_capture_skipped() {
+  local serial="$1" output="$2"
+  PRIVACY_SKIPPED=1
+  write_status suppressed 'Aufnahme durch Zeitfenster/Helligkeitsprüfung verworfen'
+  cr_log INFO "Aufnahme $serial durch Aufnahmeschutz ausgelassen"
+  tail -c 2048 -- "$output" > "$SERVER_RUNTIME_DIR/privacy.last-decision" 2>/dev/null || true
+}
+
+# Die Serverbestaetigung genau einmal strukturiert lesen. Ungueltiges JSON,
+# doppelte oder verschleierte Feldnamen, falsche Datentypen und eine fremde
+# Upload-ID duerfen das Entfernen unserer noch benoetigten Bilddatei nicht erlauben.
+upload_json_is_ok() {
+  /usr/bin/python3 - "$UPLOAD_RESPONSE_FILE" "${1:-legacy}" "${2:-}" <<'JSON_ACK'
+import json, sys
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+try:
+    with open(sys.argv[1], "rb") as response:
+        raw = response.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("response too large")
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("constant")))
+    valid = isinstance(value, dict) and value.get("ok") is True
+    if sys.argv[2] == "chunk":
+        valid = valid and value.get("protocol") == "camera-rpi-chunk-v1"
+        if sys.argv[3]:
+            valid = valid and value.get("upload_id") == sys.argv[3]
+    sys.exit(0 if valid else 1)
+except (OSError, ValueError, UnicodeError, RecursionError):
+    sys.exit(1)
+JSON_ACK
+}
+
+# Nur eine ausdrueckliche 409-Antwort fuer genau diese Bytes/diesen Auftrag
+# ist dauerhaft. Generische409,500,Proxyfehler und fremde Antworten bleiben
+# wiederholbar. Der Aufrufer prueft den HTTP-Code; dies ist niemals ein ACK.
+upload_slot_conflict_matches() {
+  /usr/bin/python3 - "$UPLOAD_RESPONSE_FILE" "$1" "$2" <<'JSON_CONFLICT'
+import hashlib,json,sys
+def unique(pairs):
+    value={}
+    for k,v in pairs:
+        if k in value:raise ValueError('duplicate key')
+        value[k]=v
+    return value
+try:
+    with open(sys.argv[1],'rb') as f:raw=f.read(65537)
+    if len(raw)>65536:raise ValueError('oversize')
+    value=json.loads(raw,object_pairs_hook=unique)
+    with open(sys.argv[2],'rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
+    valid=(isinstance(value,dict) and value.get('ok') is False
+        and value.get('error')=='immutable_slot_conflict'
+        and type(value.get('timestamp')) is int and value['timestamp']==int(sys.argv[3])
+        and value.get('sha256')==digest)
+    sys.exit(0 if valid else 1)
+except (OSError,ValueError,UnicodeError,RecursionError):sys.exit(1)
+JSON_CONFLICT
+}
+
+upload_response_is_ok() {
+  upload_json_is_ok legacy
+}
+
+chunk_response_is_ok() {
+  upload_json_is_ok chunk
+}
+
+chunk_response_matches_upload() {
+  upload_json_is_ok chunk "$1"
+}
+
+# Fragt den neuen Endpunkt mit demselben geheimen Header ab, der auch fuer den
+# Upload gilt. Nur die ausdrueckliche Protokollkennung schaltet Chunk-v1 frei.
+# Ein alter Server, ein Proxy mit 404 oder eine unverstaendliche Antwort gelten
+# als "nicht unterstuetzt" und fuehren spaeter zum sicheren Legacy-Fallback.
+chunk_upload_is_supported() {
+  local http_code
+  # Diese Anfrage prueft nur, ob der Server Teil-Uploads unterstuetzt. Sie
+  # darf nicht so lange warten wie die normale Abfrage nach neuen Auftraegen.
+  local capability_timeout="$COMMAND_TIMEOUT_SECONDS"
+  (( capability_timeout <= 30 )) || capability_timeout=30
+
+  rm -f -- "$UPLOAD_RESPONSE_FILE"
+  curl_common_arguments
+  http_code="$($CURL_BIN "${CURL_ARGUMENTS[@]}" \
+    --max-time "$capability_timeout" \
+    --max-filesize 65536 \
+    --config "$UPLOAD_FORM_FILE" \
+    --header "@$UPLOAD_HEADER_FILE" \
+    --form-string "action=capabilities" \
+    --form-string "wc=$CAMERA_SLUG" \
+    --output "$UPLOAD_RESPONSE_FILE" \
+    --write-out '%{http_code}' \
+    "$CHUNK_UPLOAD_URL")" || return 1
+  [[ "$http_code" =~ ^2[0-9][0-9]$ ]] && chunk_response_is_ok
+}
+
+# Erlaubte Schreibweise fuer ISO-/Belichtungsangaben pruefen. Eine solche
+# Zeile in der Upload-Antwort ist noch kein auszufuehrender Auftrag. Nur ein
+# frischer, gepruefter Befehl aus der Befehlsabfrage darf im EOS-Profil wirken.
+legacy_isoexp_line_is_valid() {
+  local line="$1" iso
+  ((${#line} <= 128)) || return 1
+  [[ "$line" =~ ^webcam_isoexp[[:blank:]]+(0|Auto|[1-9][0-9]{0,5})([[:blank:]]+[0-5])?[[:blank:]]*$ ]] || return 1
+  iso="${BASH_REMATCH[1]}"
+  [[ "$iso" == Auto ]] || (( iso <= 102400 ))
+}
+
+# Der alte Foto-Webcam-Server kann nach einem Upload eine ISO-/Belichtungszeile
+# statt einer leeren Antwort liefern. Deshalb genau diese bekannte Datenzeile
+# zulassen. Fehlermeldungen oder HTML sind keine Upload-Bestaetigung.
+# Die Zeile wird hier niemals ausgefuehrt: Kamerabefehle kommen ausschliesslich
+# ueber den getrennten, geprueften Befehlsweg.
+legacy_upload_feedback_is_ok() {
+  local size line
+  local -a lines=()
+  [[ -f "$UPLOAD_RESPONSE_FILE" ]] || return 1
+  size="$(stat -c %s -- "$UPLOAD_RESPONSE_FILE")" || return 1
+  (( size > 0 && size <= 128 )) || return 1
+  # Nullbytes und andere unzulaessige Steuerzeichen vor dem Einlesen ablehnen.
+  [[ "$(LC_ALL=C tr -d '\11\12\15\40-\176' < "$UPLOAD_RESPONSE_FILE" | wc -c)" -eq 0 ]] || return 1
+  mapfile -t lines < "$UPLOAD_RESPONSE_FILE"
+  (( ${#lines[@]} == 1 )) || return 1
+  line="${lines[0]%$'\r'}"
+  legacy_isoexp_line_is_valid "$line"
+}
+
+# Ganzes JPEG mit historischen Multipart-Feldern senden. Leere erfolgreiche
+# HTTP-Antworten gelten hier ebenfalls als Bestaetigung, nicht im Chunk-Vertrag.
+upload_legacy_transfer() {
+  local image="$1"
+  local serial="$2"
+  local http_code
+  local upload_stamp="$serial"
+  local -a stamp_lines=()
+  # Fuer den alten Server stammt 'now' aus der zum Bild gespeicherten
+  # Kalenderzeit, nie aus der aktuellen Sendezeit oder den Kamera-EXIF-Daten.
+  # Die numerische Auftragsnummer bleibt fuer Spool und Teil-Upload dieselbe.
+  if [[ -e "$image.legacy-stamp" || -L "$image.legacy-stamp" ]]; then
+    [[ -f "$image.legacy-stamp" && ! -L "$image.legacy-stamp" \
+      && "$(stat -c %s -- "$image.legacy-stamp")" == 14 ]] \
+      || { cr_fail "Ungueltige gespeicherte Legacy-Aufnahmezeit fuer $serial"; return 1; }
+    [[ "$(LC_ALL=C tr -d '\12_0-9' < "$image.legacy-stamp" | wc -c)" -eq 0 ]] \
+      || { cr_fail "Steuerzeichen in gespeicherter Legacy-Aufnahmezeit fuer $serial"; return 1; }
+    mapfile -t stamp_lines < "$image.legacy-stamp"
+    (( ${#stamp_lines[@]} == 1 )) && legacy_capture_stamp_is_valid "${stamp_lines[0]}" \
+      || { cr_fail "Ungueltige gespeicherte Legacy-Aufnahmezeit fuer $serial"; return 1; }
+    upload_stamp="${stamp_lines[0]}"
+  fi
+
+  rm -f -- "$UPLOAD_RESPONSE_FILE"
+  curl_common_arguments
+  http_code="$($CURL_BIN "${CURL_ARGUMENTS[@]}" \
+    --max-time "$UPLOAD_TIMEOUT_SECONDS" \
+    --max-filesize 65536 \
+    --config "$UPLOAD_FORM_FILE" \
+    --header "@$UPLOAD_HEADER_FILE" \
+    --header "X-Capture-Timestamp: $serial" \
+    --form-string "wc=$CAMERA_SLUG" \
+    --form-string "now=$upload_stamp" \
+    --form "upload=@$image;type=image/jpeg" \
+    --output "$UPLOAD_RESPONSE_FILE" \
+    --write-out '%{http_code}' \
+    "$UPLOAD_URL")" || return 1
+  if [[ "$http_code" == 409 ]] && upload_slot_conflict_matches "$image" "$serial"; then return 4; fi
+  # Bei Netzwerk- oder HTTP-Fehlern bleibt das Bild erhalten, selbst wenn
+  # ein Teil des Antworttextes bereits wie eine Bestaetigung aussieht.
+  [[ "$http_code" =~ ^2[0-9][0-9]$ ]] || return 1
+  if upload_response_is_ok || [[ ! -s "$UPLOAD_RESPONSE_FILE" ]]; then
+    return 0
+  fi
+  if [[ "$http_code" == 200 ]] && legacy_upload_feedback_is_ok; then
+    cr_log INFO "Legacy-Upload bestaetigt; ISO/Belichtungs-Hinweis nicht ausgefuehrt"
+    return 0
+  fi
+  return 1
+}
+
+# Sendet ein Bild stueckweise. Jeder Teil und das Gesamtbild tragen einen
+# SHA-256-Pruefwert. Die Upload-ID ist fuer denselben Serverauftrag stabil;
+# nach einem Abbruch kann die Gegenstelle bereits vorhandene Teile deshalb
+# gefahrlos erneut bestaetigen. Erst finalize bestaetigt das ganze JPEG.
+upload_chunked_transfer() {
+  local image="$1"
+  local serial="$2"
+  local total_size
+  local total_chunks
+  local full_hash_output
+  local full_hash
+  local upload_id_output
+  local upload_id
+  local chunk_index
+  local chunk_hash_output
+  local chunk_hash
+  local http_code
+
+  total_size="$(stat -c '%s' "$image" 2>/dev/null)" || return 1
+  [[ "$total_size" =~ ^[0-9]+$ ]] || return 1
+  total_chunks=$(((total_size + UPLOAD_CHUNK_BYTES - 1) / UPLOAD_CHUNK_BYTES))
+  full_hash_output="$($SHA256SUM_BIN -- "$image")" || return 1
+  full_hash="${full_hash_output%% *}"
+  [[ "$full_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
+  upload_id_output="$(printf '%s' "$CAMERA_SLUG:$serial:$full_hash" | "$SHA256SUM_BIN")" || return 1
+  upload_id="${upload_id_output%% *}"
+  upload_id="${upload_id:0:32}"
+
+  for ((chunk_index = 0; chunk_index < total_chunks; chunk_index++)); do
+    rm -f -- "$UPLOAD_CHUNK_FILE" "$UPLOAD_RESPONSE_FILE"
+    "$DD_BIN" if="$image" of="$UPLOAD_CHUNK_FILE" \
+      bs="$UPLOAD_CHUNK_BYTES" skip="$chunk_index" count=1 status=none \
+      || return 1
+    chunk_hash_output="$($SHA256SUM_BIN -- "$UPLOAD_CHUNK_FILE")" || return 1
+    chunk_hash="${chunk_hash_output%% *}"
+    [[ "$chunk_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
+
+    curl_common_arguments
+    http_code="$($CURL_BIN "${CURL_ARGUMENTS[@]}" \
+      --max-time "$UPLOAD_TIMEOUT_SECONDS" \
+      --max-filesize 65536 \
+      --config "$UPLOAD_FORM_FILE" \
+      --header "@$UPLOAD_HEADER_FILE" \
+      --form-string "action=chunk" \
+      --form-string "wc=$CAMERA_SLUG" \
+      --form-string "upload_id=$upload_id" \
+      --form-string "now=$serial" \
+      --form-string "total_size=$total_size" \
+      --form-string "chunk_size=$UPLOAD_CHUNK_BYTES" \
+      --form-string "total_chunks=$total_chunks" \
+      --form-string "sha256=$full_hash" \
+      --form-string "chunk_index=$chunk_index" \
+      --form-string "chunk_sha256=$chunk_hash" \
+      --form "upload=@$UPLOAD_CHUNK_FILE;type=application/octet-stream" \
+      --output "$UPLOAD_RESPONSE_FILE" \
+      --write-out '%{http_code}' \
+      "$CHUNK_UPLOAD_URL")" || return 1
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]] \
+        || ! chunk_response_matches_upload "$upload_id" \
+        || ! grep -Eq '"chunk_index"[[:space:]]*:[[:space:]]*'"$chunk_index"'([[:space:]]*[,}])' "$UPLOAD_RESPONSE_FILE"; then
+      return 1
+    fi
+  done
+
+  rm -f -- "$UPLOAD_CHUNK_FILE" "$UPLOAD_RESPONSE_FILE"
+  curl_common_arguments
+  http_code="$($CURL_BIN "${CURL_ARGUMENTS[@]}" \
+    --max-time "$UPLOAD_TIMEOUT_SECONDS" \
+    --max-filesize 65536 \
+    --config "$UPLOAD_FORM_FILE" \
+    --header "@$UPLOAD_HEADER_FILE" \
+    --form-string "action=finalize" \
+    --form-string "wc=$CAMERA_SLUG" \
+    --form-string "upload_id=$upload_id" \
+    --form-string "now=$serial" \
+    --form-string "total_size=$total_size" \
+    --form-string "chunk_size=$UPLOAD_CHUNK_BYTES" \
+    --form-string "total_chunks=$total_chunks" \
+    --form-string "sha256=$full_hash" \
+    --output "$UPLOAD_RESPONSE_FILE" \
+    --write-out '%{http_code}' \
+    "$CHUNK_UPLOAD_URL")" || return 1
+  if [[ "$http_code" == 409 ]] && upload_slot_conflict_matches "$image" "$serial"; then return 4; fi
+  [[ "$http_code" =~ ^2[0-9][0-9]$ ]] && chunk_response_matches_upload "$upload_id"
+}
+
+# Nur Bild und Wetter-Sidecar dieses Zielspools entfernen. Andere Server besitzen
+# eigene Dateien; die veroeffentlichte lokale RAM-Vorschau bleibt ebenfalls bestehen.
+delete_confirmed_image() {
+  local image="$1"
+  local serial="$2"
+  local result=0
+
+  if begin_operation; then
+    if rm -f -- "$image" "$image.weather.json" "$image.legacy-stamp" "$image.captured"; then
+      if (( ${POOL_ENABLED:-0} )); then
+        cr_pool_acknowledge "$serial" || result=1
+      fi
+      cr_log INFO "Bild $serial von Server bestaetigt und lokal geloescht"
+    else
+      cr_fail "Bestaetigtes Bild $serial konnte lokal nicht geloescht werden"
+      result=1
+    fi
+    release_operation_lock || result=1
+  else
+    # Die Gegenstelle besitzt das Bild bereits. Lokal bleibt es erhalten; der
+    # deduplizierende Endpunkt bestaetigt den naechsten Versuch erneut.
+    result=1
+  fi
+  return "$result"
+}
+
+upload_one_image() {
+  local image="$1" upload_fd result
+  # Noch unter der gemeinsamen Sperre das Bild zum Lesen sperren. Danach
+  # darf die Kamera weiterarbeiten, aber die Bereinigung darf diese Datei
+  # waehrend des gesamten Uploads nicht aus der Versandliste entfernen.
+  begin_operation || return 1
+  if [[ ! -f "$image" ]]; then release_operation_lock; return $?; fi
+  if ! { exec {upload_fd}<"$image" && "$FLOCK_BIN" -s -n "$upload_fd"; }; then
+    [[ -z "${upload_fd:-}" ]] || exec {upload_fd}<&-
+    release_operation_lock || true
+    return 1
+  fi
+  if ! release_operation_lock; then exec {upload_fd}<&-; return 1; fi
+  if upload_one_image_locked "$image"; then result=0; else result=$?; fi
+  exec {upload_fd}<&-
+  if (( result == 3 )); then quarantine_image "$image"; return $?; fi
+  if (( result == 4 )); then quarantine_image "$image" immutable_slot_conflict; return $?; fi
+  return "$result"
+}
+
+# Der Aufrufer haelt die Lesesperre auf der geoeffneten Bilddatei und gibt sie
+# nach dieser Funktion wieder frei, auch bei Fehlern. Die physische Kamera
+# ist waehrend des Netzversands nicht gesperrt.
+upload_one_image_locked() {
+  local image="$1"
+  local serial
+  local result=1
+
+  serial="$(basename -- "$image" .jpg)"
+  [[ "$serial" =~ ^[0-9]{10}$ ]] \
+    || { cr_fail "Ungueltiges Bild im Spool: $image"; return 1; }
+
+  local validation=0
+  decoded_jpeg "$image" || validation=$?
+  (( validation != 1 )) || return 3
+  (( validation == 0 )) || { cr_fail 'JPEG-Pruefung nicht verfuegbar; Bild bleibt im Spool'; return 1; }
+
+  # Der Netzwerktransfer braucht weder die Kamera noch ein schreibbares Root.
+  # Er laeuft deshalb ausserhalb der globalen Sperre: Ein langsamer Zielserver
+  # darf die Aufnahmen fuer andere Server nicht aufhalten. Nur das spaetere
+  # Loeschen der bestaetigten Spooldatei bekommt wieder ein kurzes rw-Fenster.
+  write_status uploading "Bild $serial wird zu $SERVER_ID uebertragen"
+  cr_write_header_file "X-Upload-Key" "$KEY_FILE" "$UPLOAD_HEADER_FILE" \
+    || return 1
+
+  cr_read_secret "$KEY_FILE" || return 1
+  (umask 077
+   printf 'form-string = "key=%s"\n' "$CR_SECRET" > "$UPLOAD_FORM_FILE"
+  ) || {
+    unset CR_SECRET
+    cr_fail "Private Upload-Formulardatei kann nicht geschrieben werden"
+    return 1
+  }
+  unset CR_SECRET
+
+  # Die Begleitdatei bewahrt die beobachtete Aufnahmezeit auch bei spaetem
+  # Versand. Bei alten Bildern ohne diese Datei bleibt das neue Feld weg;
+  # wir erfinden keine nachtraegliche Aufnahmezeit.
+  local captured_at="$serial" captured_text
+  if [[ -e "$image.captured" || -L "$image.captured" ]]; then
+    [[ -f "$image.captured" && ! -L "$image.captured" && $(stat -c %s -- "$image.captured") == 11 ]] || return 1
+    captured_text="$(cat -- "$image.captured")"
+    [[ "$captured_text" =~ ^[1-9][0-9]{9}$ ]] || return 1
+    captured_at="$captured_text"
+    printf 'form-string = "captured_at=%s"\n' "$captured_at" >> "$UPLOAD_FORM_FILE" || return 1
+  fi
+  if [[ -r "$WEATHER_HELPER" && -f "$image.weather.json" ]]; then
+    /usr/bin/python3 "$WEATHER_HELPER" form "$image.weather.json" "$UPLOAD_FORM_FILE" "$captured_at" \
+      || cr_log WARNING "Lokale Wetterdaten fuer Bild $serial nicht gesendet"
+  fi
+  if [[ "$EFFECTIVE_UPLOAD_MODE" == "chunked" ]]; then
+    if chunk_upload_is_supported; then
+      write_status uploading "Bild $serial wird in $UPLOAD_CHUNK_BYTES-Byte-Teilen uebertragen"
+      cr_log INFO "Gegenstelle bestaetigt Chunk-v1 fuer Bild $serial"
+      if upload_chunked_transfer "$image" "$serial"; then result=0; else result=$?; fi
+    else
+      cr_log INFO "Gegenstelle bestaetigt Chunk-v1 nicht; Legacy-Fallback fuer Bild $serial"
+      if upload_legacy_transfer "$image" "$serial"; then result=0; else result=$?; fi
+    fi
+  else
+    if upload_legacy_transfer "$image" "$serial"; then result=0; else result=$?; fi
+  fi
+
+  rm -f -- "$UPLOAD_HEADER_FILE" "$UPLOAD_FORM_FILE" "$UPLOAD_RESPONSE_FILE" "$UPLOAD_CHUNK_FILE"
+  if (( result == 0 )); then
+    delete_confirmed_image "$image" "$serial" || result=1
+  elif (( result != 4 )); then
+    cr_fail "Upload $serial nicht bestaetigt; Bild bleibt im Spool"
+  fi
+  return "$result"
+}
+
+process_one_pending_item() {
+  local request
+  local image
+
+  # Vor neuen Aufnahmen immer zuerst das aelteste wartende Bild bearbeiten.
+  # Es bleibt bei Uploadfehlern erhalten. Nur Bestaetigung oder ausdrueckliches
+  # Verwerfen (defektes Bild/Poollimit) entfernt es aus dieser Versandliste.
+  image="$(oldest_file "$SERVER_SPOOL_DIR/images" .jpg)"
+  if [[ -n "$image" ]]; then
+    upload_one_image "$image"
+    return $?
+  fi
+  request="$(oldest_file "$SERVER_SPOOL_DIR/requests" .request)"
+  if [[ -n "$request" ]]; then
+    capture_one_request "$request" || return 1
+    image="$(oldest_file "$SERVER_SPOOL_DIR/images" .jpg)"
+    [[ -z "$image" ]] || upload_one_image "$image"
+    return $?
+  fi
+  return 0
+}
+
+# Lokale und entfernte Bedienoberflaeche nutzen dieselbe Fokus-Warteschlange.
+# Eine relative Bewegung des Objektivs wird nur einmal versucht: Nach einem
+# Fehler koennte sie schon erfolgt sein. Automatisches Wiederholen wuerde dann
+# weiter als gewuenscht verstellen; der Betreiber muss erneut entscheiden.
+queue_focus() {
+  local serial="$1" mode="$2" focus_fd last=''
+  [[ "$CAPTURE_BACKEND" == gphoto2 && "$serial" =~ ^[0-9]{10}$ ]] && cr_focus_mode_valid "$mode" || return 1
+  serial_is_current "$serial" || return 1
+  exec {focus_fd}>"$SERVER_RUNTIME_DIR/focus.lock"
+  "$FLOCK_BIN" -n "$focus_fd" || { exec {focus_fd}>&-; return 1; }
+  if [[ -f "$SERVER_RUNTIME_DIR/focus.last-remote" ]]; then read -r last < "$SERVER_RUNTIME_DIR/focus.last-remote" || true; fi
+  local result=0
+  if [[ "$last" != "$serial:$mode" ]]; then
+    if [[ -e "$SERVER_RUNTIME_DIR/focus.request" ]]; then
+      cr_fail "Lokaler Fokus wartet bereits; Remote-Fokus nicht uebernommen"
+      result=1
+    else
+      printf '%s\n%s\n' "$serial" "$mode" > "$SERVER_RUNTIME_DIR/focus.request.tmp.$$" \
+        && mv -f -- "$SERVER_RUNTIME_DIR/focus.request.tmp.$$" "$SERVER_RUNTIME_DIR/focus.request" \
+        && printf '%s:%s\n' "$serial" "$mode" > "$SERVER_RUNTIME_DIR/focus.last-remote" || result=1
+    fi
+  fi
+  "$FLOCK_BIN" -u "$focus_fd"
+  exec {focus_fd}>&-
+  return "$result"
+}
+
+# Relative Fokusbewegung erst nach Kamera-Lock versuchen, dann nicht automatisch
+# wiederholen. USB/V4L2 bleibt ausgeschlossen; kein Root-rw-Fenster erforderlich.
+process_focus() {
+  [[ -f "$SERVER_RUNTIME_DIR/focus.request" ]] || return 0
+  local focus_fd result=0 mode serial
+  local -a request=()
+  exec {focus_fd}>"$SERVER_RUNTIME_DIR/focus.lock"
+  "$FLOCK_BIN" -n "$focus_fd" || { exec {focus_fd}>&-; return 1; }
+  mapfile -t request < "$SERVER_RUNTIME_DIR/focus.request"
+  serial="${request[0]:-}" mode="${request[1]:-}"
+  if [[ "$CAPTURE_BACKEND" != gphoto2 || ${#request[@]} != 2 || ! "$serial" =~ ^[0-9]{10}$ ]] \
+    || ! cr_focus_mode_valid "$mode" || ! serial_is_current "$serial"; then
+    rm -f -- "$SERVER_RUNTIME_DIR/focus.request"
+    "$FLOCK_BIN" -u "$focus_fd"; exec {focus_fd}>&-
+    cr_fail "Fokusauftrag ungueltig oder abgelaufen"
+    return 1
+  fi
+  # Fokus braucht nur USB und RAM, kein beschreibbares Root-Dateisystem.
+  # Eine laufende Aufnahme hat Vorrang; bei belegter Sperre wartet der Fokus.
+  exec {OPERATION_LOCK_FD}>"$OPERATION_LOCK"
+  if ! "$FLOCK_BIN" -w 2 "$OPERATION_LOCK_FD"; then
+    exec {OPERATION_LOCK_FD}>&-; OPERATION_LOCK_FD=''
+    "$FLOCK_BIN" -u "$focus_fd"; exec {focus_fd}>&-
+    write_status waiting "Fokus wartet auf Kamerasperre"
+    return 1
+  fi
+  rm -f -- "$SERVER_RUNTIME_DIR/focus.request" || { release_operation_lock; exec {focus_fd}>&-; return 1; }
+  "$FLOCK_BIN" -u "$focus_fd"; exec {focus_fd}>&-
+  cr_log INFO "Fokus $mode beginnt"
+  # Verfuegbare Fokusfunktionen und Vorschau nur beim Fokusauftrag abfragen,
+  # nicht bei jedem normalen Foto. Der Helfer begrenzt die Wartezeiten und
+  # stellt den vorherigen Liveview-Zustand unter derselben Sperre wieder her.
+  # Im Protokoll bleibt hier nur das Ergebnis, nicht die lange Kameraausgabe.
+  cr_focus_to_camera "$mode" >/dev/null 2>&1 || result=$?
+  release_operation_lock || result=1
+  printf 'updated_epoch=%s\nmode=%s\nexit_code=%s\n' "$(date +%s)" "$mode" "$result" > "$SERVER_RUNTIME_DIR/focus.status"
+  if (( result == 0 )); then
+    cr_log INFO "Fokus $mode ausgefuehrt"
+    write_status waiting "Fokus $mode ausgefuehrt"
+  else
+    cr_fail "Fokus $mode fehlgeschlagen (Exit $result); keine automatische Wiederholung"
+    write_status error "Fokus fehlgeschlagen; gphoto2/Objektiv pruefen"
+  fi
+  return "$result"
+}
+
+# Nur ein Worker je Ziel darf diese Auftragsdatei schreiben. Den vom Server
+# abgeholten ISO-/Belichtungsauftrag vor dem Warten auf die Kamera im RAM
+# sichern; einen anderen wartenden Auftrag niemals ueberschreiben.
+# Die letzte versuchte Nummer verhindert Wiederholung nach einem Worker-Neustart
+# innerhalb desselben Pi-Starts. RAM-Merker ueberstehen keinen Pi-Neustart.
+queue_isoexp() {
+  local serial="$1" command_line="$2" last=0 request="$SERVER_RUNTIME_DIR/isoexp.request"
+  [[ "$CAPTURE_BACKEND" == gphoto2 && "$GPHOTO_CAPTURE_MODE" == eos-legacy && "$serial" =~ ^[0-9]{10}$ ]] \
+    && serial_is_current "$serial" && legacy_isoexp_line_is_valid "$command_line" || return 1
+  if [[ -f "$SERVER_RUNTIME_DIR/isoexp.last" ]]; then
+    read -r last < "$SERVER_RUNTIME_DIR/isoexp.last" || return 1
+    [[ "$last" =~ ^[0-9]{10}$ ]] || return 1
+    (( 10#$serial > 10#$last )) || return 0
+  fi
+  if [[ -e "$request" ]]; then
+    cmp -s "$request" <(printf '%s\n%s\n' "$serial" "$command_line")
+    return $?
+  fi
+  printf '%s\n%s\n' "$serial" "$command_line" > "$request.tmp.$$" \
+    && mv -f -- "$request.tmp.$$" "$request"
+}
+
+# Status mit festen Datenfeldern im privaten RAM ablegen. Bleibt nach einem
+# Abbruch 'applying' stehen, ist die Wirkung auf die Kamera UNBEKANNT.
+# Das ist keine Erfolgsmeldung und wird nicht automatisch erneut ausgefuehrt.
+write_isoexp_status() {
+  local state="$1" serial="$2" iso="$3" step="$4" code="$5"
+  local path="$SERVER_RUNTIME_DIR/isoexp.status"
+  {
+    printf 'updated_epoch=%s\nrequest=%s\nstate=%s\n' "$(date +%s)" "$serial" "$state"
+    printf 'iso=%s\nexposure_step=%s\nexit_code=%s\n' "$iso" "$step" "$code"
+  } > "$path.tmp.$$" && mv -f -- "$path.tmp.$$" "$path"
+}
+
+# Nur gepruefte ISO-Werte und ganze Belichtungskorrekturstufen (EV) an gphoto
+# uebergeben; den empfangenen Text niemals als Shellbefehl ausfuehren.
+# Das gilt ausschliesslich fuer das EOS-Profil. Aufnahme, Fokus und Verstellen
+# verwenden dieselbe Kamerasperre. Ist sie belegt, bleibt der Auftrag wartend.
+# Nach begonnenem USB-Versuch hingegen keine automatische Wiederholung.
+process_isoexp() {
+  local request="$SERVER_RUNTIME_DIR/isoexp.request" serial line name iso step last=0 result=0
+  local output="$SERVER_RUNTIME_DIR/isoexp.output"
+  local -a fields=() arguments=()
+  [[ -e "$request" ]] || return 0
+  if [[ -f "$request" && ! -L "$request" && "$(stat -c %s -- "$request")" -le 160 ]] \
+    && [[ "$(LC_ALL=C tr -d '\11\12\40-\176' < "$request" | wc -c)" -eq 0 ]]; then
+    mapfile -t fields < "$request"
+  fi
+  serial="${fields[0]:-}" line="${fields[1]:-}"
+  if [[ "$CAPTURE_BACKEND" != gphoto2 || "$GPHOTO_CAPTURE_MODE" != eos-legacy \
+    || ${#fields[@]} != 2 || ! "$serial" =~ ^[0-9]{10}$ ]] \
+    || ! serial_is_current "$serial" || ! legacy_isoexp_line_is_valid "$line"; then
+    rm -f -- "$request"
+    cr_fail "ISO/Belichtungs-Auftrag ungueltig, abgelaufen oder Profil nicht unterstuetzt"
+    write_status rejected "ISO/Belichtungs-Auftrag verworfen"
+    return 1
+  fi
+  if [[ -f "$SERVER_RUNTIME_DIR/isoexp.last" ]]; then
+    read -r last < "$SERVER_RUNTIME_DIR/isoexp.last" || return 1
+    [[ "$last" =~ ^[0-9]{10}$ ]] || return 1
+    if (( 10#$serial <= 10#$last )); then rm -f -- "$request"; return 0; fi
+  fi
+  read -r name iso step <<< "$line"
+  [[ "$iso" == 0 ]] || arguments+=(--set-config-value "iso=$iso")
+  if [[ -n "$step" ]]; then
+    # Den EV-Wert selbst setzen, z.B. 1 fuer +1 EV. Die Position dieses Wertes
+    # in der Auswahlliste kann je Kameramodell unterschiedlich sein.
+    arguments+=(--set-config-value "exposurecompensation=$step")
+  fi
+  exec {OPERATION_LOCK_FD}>"$OPERATION_LOCK"
+  if ! "$FLOCK_BIN" -w 2 "$OPERATION_LOCK_FD"; then
+    exec {OPERATION_LOCK_FD}>&-; OPERATION_LOCK_FD=''
+    write_status waiting "ISO/Belichtung wartet auf Kamerasperre"
+    return 1
+  fi
+  # Den Versuch vor dem USB-Zugriff vermerken. Nach einem Prozessabbruch ist
+  # eventuell schon etwas verstellt; dafuer einen neuen Serverauftrag abwarten.
+  if ! { write_isoexp_status applying "$serial" "$iso" "$step" '' \
+    && printf '%s\n' "$serial" > "$SERVER_RUNTIME_DIR/isoexp.last.tmp.$$" \
+    && mv -f -- "$SERVER_RUNTIME_DIR/isoexp.last.tmp.$$" "$SERVER_RUNTIME_DIR/isoexp.last" \
+    && rm -f -- "$request"; }; then
+    release_operation_lock || true
+    return 1
+  fi
+  cr_log INFO "ISO/Belichtung $serial beginnt (ISO=$iso, Stufe=${step:-unveraendert} EV)"
+  printf 'request=%s\n' "$serial" > "$output" || result=1
+  if (( result == 0 && ${#arguments[@]} )); then
+    # Einstellungen in derselben Verbindung zuruecklesen. Die begrenzte
+    # Diagnose bleibt im RAM. Dieser Weg loest kein Bild aus und schaltet
+    # weder Heizung noch Luefter oder Root-Schreibschutz um.
+    (ulimit -f 128; LC_ALL=C "$TIMEOUT_BIN" --kill-after=2 15 "$GPHOTO_BIN" \
+      "${arguments[@]}" --get-config iso --get-config exposurecompensation > "$output.tmp.$$" 2>&1) || result=$?
+    tail -c 65280 -- "$output.tmp.$$" >> "$output" || result=1
+    rm -f -- "$output.tmp.$$"
+  fi
+  release_operation_lock || result=1
+  if (( result == 0 )); then
+    write_isoexp_status completed "$serial" "$iso" "$step" 0 || return 1
+    cr_log INFO "ISO/Belichtungs-Auftrag $serial ausgefuehrt (ISO=$iso, Stufe=${step:-unveraendert} EV)"
+    write_status waiting "ISO/Belichtung erfolgreich uebernommen"
+  else
+    write_isoexp_status failed "$serial" "$iso" "$step" "$result" || return 1
+    cr_fail "ISO/Belichtung $serial fehlgeschlagen (Exit $result); keine automatische Wiederholung"
+    write_status error "ISO/Belichtung fehlgeschlagen; Details in isoexp.output"
+  fi
+  return "$result"
+}
+
+# Reihenfolge: lokaler Fokus, wartende ISO/Belichtung, lokaler Capture,
+# wartender Zielspool, dann Poll.
+# Ein fehlgeschlagener Upload bleibt erhalten und blockiert nur dieses Ziel.
+run_iteration() {
+  local result=0
+  PRIVACY_SKIPPED=0
+  local manual_fd manual_serial
+
+  heartbeat
+  report_capture_failure || cr_log WARNING 'Aufnahmefehler konnte nicht fuer Serverprotokoll vorbereitet werden'
+  # Gemeinsame Kameraeinstellungen neu laden; Schluessel, Zieladresse und
+  # Versandart dieses Workers behalten. Bereits fertige Poolbilder werden
+  # durch eine Konfigurationsaenderung nicht neu aufgenommen oder veraendert.
+  if (( POOL_REQUIRED )); then
+    cr_pool_load || return 1
+    (( POOL_ENABLED )) || { cr_fail 'Poolkonfiguration entfernt; koordinierter Neustart erforderlich'; return 1; }
+    begin_operation || return 1
+    if ! cr_pool_recover; then release_operation_lock || true; return 1; fi
+    release_operation_lock || return 1
+  fi
+  if [[ -f "$SERVER_RUNTIME_DIR/focus.request" ]]; then
+    process_focus
+    return $?
+  fi
+  if [[ -f "$SERVER_RUNTIME_DIR/isoexp.request" ]]; then
+    process_isoexp
+    return $?
+  fi
+  # Nur diese Worker-Instanz uebernimmt ihren lokalen Admin-Auftrag. Kein
+  # globaler Trigger, kein Neustart und keine Kameraarbeit im PHP-Request.
+  if [[ -f "$SERVER_RUNTIME_DIR/manual.request" ]]; then
+    exec {manual_fd}>"$SERVER_RUNTIME_DIR/manual.lock"
+    if "$FLOCK_BIN" -n "$manual_fd"; then
+      if [[ -f "$SERVER_RUNTIME_DIR/manual.request" ]]; then
+        read -r manual_serial < "$SERVER_RUNTIME_DIR/manual.request" || manual_serial=''
+        if [[ "$manual_serial" =~ ^[0-9]{10}$ ]] && queue_request "$manual_serial" '' private; then
+          rm -f -- "$SERVER_RUNTIME_DIR/manual.request"
+          "$FLOCK_BIN" -u "$manual_fd"
+          exec {manual_fd}>&-
+          process_one_pending_item
+          return $?
+        fi
+        "$FLOCK_BIN" -u "$manual_fd"
+        exec {manual_fd}>&-
+        write_status error "Manuelle Aufnahme konnte nicht uebernommen werden"
+        return 1
+      fi
+      "$FLOCK_BIN" -u "$manual_fd"
+    fi
+    exec {manual_fd}>&-
+  fi
+  promote_runtime_request || {
+    write_status error "Vorgemerkter Auftrag konnte noch nicht persistent gespeichert werden"
+    return 1
+  }
+  if ! process_one_pending_item; then
+    write_status error "Ein wartender Auftrag konnte noch nicht abgeschlossen werden"
+    return 1
+  fi
+  (( ROOT_RESTORE_FAILED == 0 )) || return 1
+
+  local pool_slot=''
+  if (( POOL_ENABLED )); then
+    # Erst die aelteren Bilder dieses Ziels senden, dann neue Auftraege abholen.
+    [[ -z "$(oldest_file "$SERVER_SPOOL_DIR/images" .jpg)" ]] || return 0
+    pool_slot="$(cr_pool_latest)" || return 1
+  fi
+  if ! poll_command; then
+    write_status error "Befehlsabfrage fehlgeschlagen"
+    return 1
+  fi
+  if ! parse_command; then
+    write_status error "Serverantwort war ungueltig"
+    return 1
+  fi
+  if [[ "$POLLED_COMMAND" == "wait" ]]; then
+    (( result == 0 && PRIVACY_SKIPPED == 0 )) && write_status waiting "Kein neuer Capture-Auftrag"
+    return "$result"
+  fi
+  if ! serial_is_current "$POLLED_SERIAL"; then
+    cr_fail "Server-Auftrag $POLLED_SERIAL ist zu alt oder liegt zu weit in der Zukunft"
+    write_status rejected "Server-Auftrag wegen unplausibler Zeit verworfen"
+    return 1
+  fi
+  # Der alte Server entfernt einen Befehl bereits bei der Abfrage. Einen
+  # hier nicht unterstuetzten ISO-Auftrag deshalb sichtbar als abgelehnt
+  # merken, niemals als ausgefuehrt melden. Weitere Fotoauftraege bleiben moeglich.
+  if [[ "$POLLED_COMMAND" == unsupported-isoexp ]]; then
+    local notice="$SERVER_RUNTIME_DIR/legacy-isoexp.status"
+    {
+      printf 'received_epoch=%s\nrequest=%s\nstate=unsupported\n' "$(date +%s)" "$POLLED_SERIAL"
+      printf 'command=%s\n' "$POLLED_LEGACY_NOTICE"
+    } > "$notice.tmp.$$" && mv -f -- "$notice.tmp.$$" "$notice" || return 1
+    cr_log WARNING "ISO/Belichtungs-Auftrag $POLLED_SERIAL nicht fuer dieses Profil unterstuetzt; nicht ausgefuehrt"
+    write_status unsupported "Legacy-ISO/Belichtung erfordert EOS-Legacy; Capture-Poll wird fortgesetzt"
+    return 0
+  fi
+  if [[ "$POLLED_COMMAND" == isoexp ]]; then
+    queue_isoexp "$POLLED_SERIAL" "$POLLED_LEGACY_NOTICE" || return 1
+    process_isoexp
+    return $?
+  fi
+  if [[ "$POLLED_COMMAND" == focus ]]; then
+    queue_focus "$POLLED_SERIAL" "$POLLED_FOCUS_MODE" || return 1
+    process_focus
+    return $?
+  fi
+  queue_request "$POLLED_SERIAL" "$POLLED_LEGACY_STAMP" "$pool_slot" || return 1
+  process_one_pending_item || result=1
+  (( result == 0 && PRIVACY_SKIPPED == 0 )) && write_status waiting "Letzter Auftrag erfolgreich abgeschlossen"
+  return "$result"
+}
+
+cr_log INFO "Worker gestartet; Key bleibt in privater Datei verborgen"
+write_status starting "Worker startet"
+
+# Die Spool-Verzeichnisse einmal beim Start vorbereiten. Ob sie einen
+# Pi-Neustart ueberstehen, haengt vom Speicherort ab; beim Pool liegen sie im RAM.
+# Im normalen Wartezustand bleibt / dadurch unangetastet und schreibgeschuetzt.
+begin_operation || exit 1
+release_operation_lock || exit 1
+
+if (( RUN_ONCE == 1 )); then
+  run_iteration
+  exit $?
+fi
+
+while true; do
+  if run_iteration; then
+    sleep "$POLL_SECONDS"
+  else
+    (( ROOT_RESTORE_FAILED == 0 )) || exit 1
+    sleep "$ERROR_BACKOFF_SECONDS"
+  fi
+done

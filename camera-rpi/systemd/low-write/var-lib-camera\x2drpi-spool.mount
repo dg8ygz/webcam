@@ -1,0 +1,11 @@
+[Unit]
+Description=Bounded RAM spool for all camera targets
+
+[Mount]
+What=tmpfs
+Where=/var/lib/camera-rpi/spool
+Type=tmpfs
+Options=mode=0700,nosuid,nodev,noatime,size=256M
+
+[Install]
+WantedBy=local-fs.target

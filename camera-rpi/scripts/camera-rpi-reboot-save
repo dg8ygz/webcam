@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# ExecStop runs AFTER sensor, regulator and every worker have stopped, but
+# BEFORE local filesystems/journald disappear. A manual stop while busy refuses
+# to snapshot a changing queue. This is not a power-loss guarantee.
+set -euo pipefail
+umask 077
+[[ $EUID == 0 && $# == 0 ]]
+for unit in camera-rpi-sensor.service camera-rpi-climate.service; do
+  state=$(systemctl show "$unit" -p ActiveState --value)
+  [[ $state == inactive || $state == failed ]] || { echo "Sicherung verweigert: $unit noch $state" >&2; exit 1; }
+done
+workers=$(systemctl list-units --type=service --state=active,activating,deactivating --plain --no-legend 'camera-rpi-worker@*.service')
+[[ -z $workers ]] || { echo 'Sicherung verweigert: Kamera-Worker noch aktiv' >&2; exit 1; }
+[[ $(findmnt -n -o FSTYPE -T /run) == tmpfs ]]
+[[ $(findmnt -n -o FSTYPE -T /var/lib/camera-rpi/spool) == tmpfs ]]
+exec 9>/run/lock/camera-rpi.operation.lock
+flock -w 120 9
+rw_owned=0
+finish() {
+  local rc=$?
+  trap - EXIT
+  if (( rw_owned )); then
+    sync
+    mount -o remount,ro / || { echo 'KRITISCH: Root nach Reboot-Sicherung nicht wieder RO' >&2; rc=1; }
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+install -d -m 0700 /run/camera-rpi-reboot
+# Only a bounded text export, not the entire volatile journal filesystem.
+# Drain all selected lines so SIGPIPE cannot hide a real journalctl error.
+journalctl --sync
+journalctl -b -n 5000 --no-pager -o short-iso |
+  php -r '$o=fopen("/run/camera-rpi-reboot/journal.log","wb"); if (!$o) exit(1); $left=8388608; while (!feof(STDIN)) { $b=fread(STDIN,65536); if ($b===false) exit(1); if ($left>0) { $p=substr($b,0,$left); if (fwrite($o,$p)!==strlen($p)) exit(1); $left-=strlen($p); } } fclose($o);'
+case ",$(findmnt -n -o OPTIONS -T /)," in
+  *,ro,*) mount -o remount,rw /; rw_owned=1 ;;
+  *,rw,*) ;;
+  *) exit 1 ;;
+esac
+/usr/bin/php -d opcache.enable_cli=0 -d opcache.file_cache= /usr/local/libexec/camera-rpi-reboot-data.php save

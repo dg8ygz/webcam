@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Real worker data path with stub camera/HTTP: retain the server's literal
+# calendar stamp, separately from the epoch used for queue IDs and freshness.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-legacy-stamp.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source "$PROJECT/scripts/lib/camera-rpi-common.sh"
+source <(sed -n -e '/^parse_command() {/,/^}/p' \
+  -e '/^legacy_isoexp_line_is_valid() {/,/^}/p' \
+  -e '/^legacy_capture_stamp_is_valid() {/,/^}/p' \
+  -e '/^legacy_capture_slot_stamp() {/,/^}/p' \
+  -e '/^read_capture_request_stamp() {/,/^}/p' \
+  -e '/^queue_request() {/,/^}/p' -e '/^oldest_file() {/,/^}/p' \
+  -e '/^promote_runtime_request() {/,/^}/p' \
+  -e '/^capture_one_request() {/,/^}/p' \
+  -e '/^upload_json_is_ok() {/,/^}/p' \
+  -e '/^upload_response_is_ok() {/,/^}/p' \
+  -e '/^upload_legacy_transfer() {/,/^}/p' \
+  -e '/^delete_confirmed_image() {/,/^}/p' "$PROJECT/scripts/camera-rpi-worker")
+SERVER_ID=fixture CAPTURE_BACKEND=gphoto2
+SERVER_RUNTIME_DIR="$STAGE/run" SERVER_SPOOL_DIR="$STAGE/spool"
+COMMAND_RESPONSE_FILE="$STAGE/command.response"
+mkdir -p "$SERVER_RUNTIME_DIR" "$SERVER_SPOOL_DIR/requests" "$SERVER_SPOOL_DIR/images"
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+printf 'command\n1789242600\nwebcam_capture 20260912_2150\n\n' > "$COMMAND_RESPONSE_FILE"
+parse_command
+expect test "${POLLED_LEGACY_STAMP:-}" = 20260912_2150
+expect test "$POLLED_SERIAL" = 1789242600
+for pair in 20260912_2158:20260912_2150 20260912_2209:20260912_2200 \
+  20260912_2359:20260912_2350 20260913_0000:20260913_0000; do
+  expect test "$(legacy_capture_slot_stamp "${pair%:*}")" = "${pair#*:}"
+done
+# Rounded value is selected by automatic command parsing, not by the upload
+# or queue helper (those also serve manual requests and must preserve data).
+printf 'command\n1789243080\nwebcam_capture 20260912_2158\n' > "$COMMAND_RESPONSE_FILE"
+parse_command
+expect test "$POLLED_LEGACY_STAMP" = 20260912_2150
+expect test "$POLLED_SERIAL" = 1789243080
+printf 'command\n1789242600\nwebcam_capture 20260912_2150\n' > "$COMMAND_RESPONSE_FILE"
+parse_command
+# An operation-lock failure must retain both values in the runtime marker.
+begin_operation() { return "${TEST_LOCK_RESULT:-0}"; }
+release_operation_lock() { :; }
+if TEST_LOCK_RESULT=1 queue_request "$POLLED_SERIAL" "$POLLED_LEGACY_STAMP"; then exit 1; fi
+expect grep -qx 20260912_2150 "$SERVER_RUNTIME_DIR/1789242600.pending"
+unset POLLED_LEGACY_STAMP POLLED_SERIAL
+promote_runtime_request
+request="$SERVER_SPOOL_DIR/requests/1789242600.request"
+expect grep -qx 20260912_2150 "$request"
+expect test ! -e "$SERVER_RUNTIME_DIR/1789242600.pending"
+# No physical camera; real queue->JPEG publication carries a private sidecar.
+write_status() { :; }
+cr_capture_to_file() { printf '\377\330test\377\331' > "$1"; }
+valid_jpeg() { return 0; }
+# This test isolates timestamp transport; full decode is covered by capture-pool.
+decoded_jpeg() { return 0; }
+publish_latest_capture() { :; }
+WEATHER_HELPER="$STAGE/no-weather"
+capture_one_request "$request"
+image="$SERVER_SPOOL_DIR/images/1789242600.jpg"
+expect test -s "$image"
+expect grep -qx 20260912_2150 "$image.legacy-stamp"
+expect test "$(stat -c %a "$image.legacy-stamp")" = 600
+expect test ! -e "$request"
+# No global polled data remain. A later transfer reads the stamp from disk;
+# changing the process timezone must not turn 21:50 into another slot.
+UPLOAD_RESPONSE_FILE="$STAGE/upload.response" UPLOAD_TIMEOUT_SECONDS=90
+UPLOAD_FORM_FILE="$STAGE/form" UPLOAD_HEADER_FILE="$STAGE/header"
+UPLOAD_URL=http://fixture.invalid/upload.php CAMERA_SLUG=bielefeld
+curl_common_arguments() { CURL_ARGUMENTS=(); }
+fake_transfer() {
+  printf '%s\n' "$@" > "$STAGE/curl.args"
+  printf '{"ok":true}\n' > "$UPLOAD_RESPONSE_FILE"
+  printf '200'
+  return "${TEST_CURL_RESULT:-0}"
+}
+CURL_BIN=fake_transfer
+if TEST_CURL_RESULT=28 upload_legacy_transfer "$image" 1789242600; then exit 1; fi
+expect test -s "$image.legacy-stamp"
+TZ=Pacific/Honolulu upload_legacy_transfer "$image" 1789242600
+expect grep -qx now=20260912_2150 "$STAGE/curl.args"
+expect test -s "$image"
+expect delete_confirmed_image "$image" 1789242600
+expect test ! -e "$image.legacy-stamp"
+# Modern/manual requests without a server stamp keep the epoch contract.
+queue_request 1789243080
+capture_one_request "$SERVER_SPOOL_DIR/requests/1789243080.request"
+image="$SERVER_SPOOL_DIR/images/1789243080.jpg"
+upload_legacy_transfer "$image" 1789243080
+expect grep -qx now=1789243080 "$STAGE/curl.args"
+for bad in 20260230_2150 20261312_2150 20260912_2460 '../2150' '20260912_2150;reboot'; do
+  if legacy_capture_stamp_is_valid "$bad"; then exit 1; fi
+  ((checks+=1))
+done
+expect legacy_capture_stamp_is_valid 20240229_2150
+# Corrupt metadata may never silently fall back to upload time/epoch.
+printf '20260912_2150\nextra\n' > "$image.legacy-stamp"
+if upload_legacy_transfer "$image" 1789243080 >/dev/null 2>&1; then exit 1; fi
+expect test -s "$image"
+printf '20260912_2150\000' > "$image.legacy-stamp"
+if upload_legacy_transfer "$image" 1789243080 >/dev/null 2>&1; then exit 1; fi
+expect test -s "$image"
+printf 'OK: %s Legacy-Aufnahmezeit-Pruefungen; Poll/Lock/Spool/Retry/Zeitzone/ACK/modern\n' "$checks"

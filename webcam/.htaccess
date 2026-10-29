@@ -1,0 +1,96 @@
+<IfModule mod_headers.c>
+  # Versionierte Assets und immutable Capture-Dateien aggressiv cachen.
+  Header always set Cache-Control "public, max-age=31536000, immutable" env=WC_CACHE_ASSET
+  Header always set Cache-Control "public, max-age=31536000, immutable" env=WC_CACHE_IMMUTABLE_IMAGE
+
+  # Current-Bilder bleiben kurzlebig, damit Live-/Overview-Refreshes nicht alt wirken.
+  Header always set Cache-Control "public, max-age=120, stale-while-revalidate=60" env=WC_CACHE_CURRENT_IMAGE
+  Header always merge Vary "Accept" env=WC_VARY_ACCEPT
+</IfModule>
+
+<IfModule mod_env.c>
+  # Ensure base path detection when deployed under /webcam.
+  SetEnvIf Request_URI "^/webcam(?:/|$)" WEBCAM_BASE_URL=webcam
+</IfModule>
+
+# PHP kann einen Multipart-Request erst authentifizieren, nachdem Apache den
+# Body empfangen hat. Diese Grenzen greifen deshalb bewusst schon im
+# Webserver. Der Legacy-Weg erlaubt 25 MiB Bilddaten plus Multipart-Reserve;
+# Chunk-v1 erlaubt den maximal 1 MiB grossen Teil plus Formular-Metadaten.
+# Wer WEBCAM_UPLOAD_MAX_BYTES erhöht, muss diese vorgelagerte Grenze getrennt
+# prüfen. Details und Edge-Limits: ops/upload-request-hardening.md.
+<FilesMatch "^upload\.php$">
+  LimitRequestBody 27262976
+</FilesMatch>
+
+<FilesMatch "^upload-chunk\.php$">
+  LimitRequestBody 2097152
+</FilesMatch>
+
+<FilesMatch "^video-command\.php$">
+  LimitRequestBody 8192
+</FilesMatch>
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # Public helper endpoints validate wc/key themselves and are used by camera devices.
+  RewriteRule ^include/(?:command|video-command|upload|upload-chunk|log)\.php$ - [L]
+
+  # Hard deny runtime/state/source paths that must never be served from docroot.
+  RewriteRule ^(?:orgin|var|database|\.git|\.npmhome|node_modules|vendor|bin|scripts|src|include|tests|templates|config|docs|ops)(?:/|$) - [F,L]
+  RewriteRule (^|/)(?:[^/]+\.(?:sqlite(?:-[^/]*)?|db|bak|log|lock|pid|env|ini|phar|sql|ya?ml|json|xml|md)|composer\.(?:json|lock)|package-lock\.json|package\.json|phpunit\.xml(?:\.dist)?)$ - [F,L]
+  RewriteRule (^|/)\.(?!well-known(?:/|$)) - [F,L]
+
+  # Versionierte Frontend-Assets koennen langfristig gecacht werden.
+  RewriteCond %{QUERY_STRING} (^|&)v=\d+(&|$)
+  RewriteRule ^assets/.+\.(?:css|js|mjs|png|jpe?g|gif|svg|webp|ico|woff2?|ttf)$ - [E=WC_CACHE_ASSET:1,L]
+
+  # Overlay-Dateien nur ueber overlay.php ausliefern, damit Validierung/Header greifen.
+  RewriteRule ^cache/[a-z0-9-]+/overlays/ - [F,L]
+
+  # New cameras use the writable cache tree without root provisioning.
+  # Preserve legacy URLs and existing physical current directories.
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteRule ^([a-z0-9-]+)/current/((?:raw|full|hu|current|[0-9]+)\.jpg|(?:current_ex|ex|latest_wx|current_wx)\.txt)$ cache/$1/current/$2 [L]
+  # Must precede the immutable archive/cache rule on the internal redirect.
+  RewriteRule ^cache/[a-z0-9-]+/current/ - [E=WC_CACHE_CURRENT_IMAGE:1,E=WC_VARY_ACCEPT:1,L]
+
+  # Fehlende datierte Bielefeld-Dateien koennen neue Pilotbilder sein.
+  # Endpoint verlangt ein vorhandenes DB-Rezept; alte Dateien bleiben unveraendert.
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteRule ^((?:cache/|storage/archive/)?bielefeld/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9_]+(?:[a-z]+)?\.jpg)$ image.php?legacy=$1 [L]
+
+  # Archiv-/Cache-Dateien sind timestamp-basiert und damit immutable.
+  RewriteRule ^(?:cache|storage)/.+\.(?:jpe?g|png|gif|webp|svg|mp4|webm)$ - [E=WC_CACHE_IMMUTABLE_IMAGE:1,L]
+
+  # Current-Bilder aendern sich in-place und bekommen nur kurze Cache-Zeiten.
+  RewriteRule ^[a-z0-9-]+/current/.+\.(?:jpe?g|png|gif|webp)$ - [E=WC_CACHE_CURRENT_IMAGE:1,E=WC_VARY_ACCEPT:1,L]
+  RewriteRule ^current/latest_.+\.(?:jpe?g|webp)$ - [E=WC_CACHE_CURRENT_IMAGE:1,E=WC_VARY_ACCEPT:1,L]
+
+  # Globale Best-Of-Seite und Kamera-Routen.
+  RewriteRule ^bestof/?$ bestof.php [QSA,L]
+  # Route /camera/<slug> to camera.php while preserving query params.
+  RewriteRule ^camera/?$ camera.php [QSA,L]
+  RewriteRule ^camera/([^/]+)/?$ camera.php?cam=$1 [QSA,L]
+  # Hidden weather overview.
+  RewriteRule ^weather/?$ weather.php [QSA,L]
+  # Route /stream/<slug> to stream.php (RTSP -> MJPEG relay).
+  RewriteRule ^stream/?$ stream.php [QSA,L]
+  RewriteRule ^stream/([^/]+)/?$ stream.php/$1 [QSA,L]
+  # Backwards compatible: /<slug> -> camera.php (exclude known top-level dirs).
+  RewriteRule ^(?!bestof(?:/|$)|camera(?:/|$)|weather(?:/|$)|stream(?:/|$)|api(?:/|$)|admin(?:/|$)|status(?:/|$)|assets(?:/|$)|storage(?:/|$)|cache(?:/|$)|current(?:/|$)|vendor(?:/|$)|bin(?:/|$)|scripts(?:/|$)|src(?:/|$)|templates(?:/|$)|tests(?:/|$)|include(?:/|$)|var(?:/|$)|database(?:/|$)|config(?:/|$)|docs(?:/|$)|ops(?:/|$)|favicon\\.ico$|filter\\.png$)([a-z0-9-]+)/?$ camera.php?cam=$1 [QSA,L]
+
+  # Public API path routing (mirrors router.php).
+  RewriteRule ^api/public/?$ api/public.php [QSA,L]
+  RewriteRule ^api/public/(.*)$ api/public.php/$1 [QSA,L]
+
+  RewriteRule ^api/history/?$ api/history.php [QSA,L]
+  RewriteRule ^api/history/(.*)$ api/history.php?slug=$1 [QSA,L]
+</IfModule>
+
+<IfModule mod_rewrite.c>
+  # Lightweight iframe embed endpoint. Appended because the CIFS server keeps .htaccess append-only.
+  RewriteEngine On
+  RewriteRule ^embed/([^/]+)/?$ embed.php?cam=$1 [QSA,L]
+</IfModule>

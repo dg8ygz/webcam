@@ -1,0 +1,14 @@
+/var/www/html/webcam/var/log/*.log
+/var/www/html/webcam/var/log/*.out
+/var/www/html/webcam/var/log/capture/*.log
+{
+  su www-data www-data
+  weekly
+  rotate 8
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+  create 640 www-data www-data
+}

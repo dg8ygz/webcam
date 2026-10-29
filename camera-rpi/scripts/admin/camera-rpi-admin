@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+
+# Eng begrenzte Root-Bruecke fuer die Admin-Webseite.
+#
+# Das PHP-Programm darf dieses eine Script ueber sudo starten. Alle Eingaben
+# kommen ueber stdin und werden hier gegen feste Regeln geprueft. Es gibt
+# absichtlich weder frei angebbare Dateipfade noch frei ausfuehrbare Befehle.
+# Ein Key erscheint deshalb weder in der URL noch in der Prozessliste.
+
+set -uo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+COMMON_LIB="${CAMERA_RPI_COMMON_LIB:-$SCRIPT_DIR/../lib/camera-rpi-common.sh}"
+if [[ -z "${CAMERA_RPI_COMMON_LIB:-}" && ! -r "$COMMON_LIB" ]]; then
+  COMMON_LIB="/usr/local/libexec/camera-rpi-common.sh"
+fi
+# shellcheck source=../lib/camera-rpi-common.sh
+[[ -r "$COMMON_LIB" ]] || { printf 'ERROR\tGemeinsame Bibliothek fehlt\n' >&2; exit 1; }
+source "$COMMON_LIB"
+
+CONFIG_DIR="${CAMERA_RPI_CONFIG_DIR:-/etc/camera-rpi/servers}"
+KEY_DIR="${CAMERA_RPI_KEY_DIR:-/etc/camera-rpi/keys}"
+RUNTIME_ROOT_DEFAULT="${CAMERA_RPI_RUNTIME_ROOT:-/run/camera-rpi}"
+SYSTEMCTL_BIN="${CAMERA_RPI_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+CLIMATE_HELPER="${CAMERA_RPI_CLIMATE_HELPER:-/usr/local/libexec/camera-rpi-climate.php}"
+GPIO_HELPER="${CAMERA_RPI_GPIO_HELPER:-/usr/local/libexec/camera-rpi-gpio.php}"
+POWER_HELPER="${CAMERA_RPI_POWER_HELPER:-/usr/local/libexec/camera-rpi-power.php}"
+PRIVACY_HELPER="${CAMERA_RPI_PRIVACY_HELPER:-/usr/local/libexec/camera-rpi-privacy.php}"
+FINDMNT_BIN="${CAMERA_RPI_FINDMNT_BIN:-/usr/bin/findmnt}"
+MOUNT_BIN="${CAMERA_RPI_MOUNT_BIN:-/usr/bin/mount}"
+FLOCK_BIN="${CAMERA_RPI_FLOCK_BIN:-/usr/bin/flock}"
+OPERATION_LOCK="${CAMERA_RPI_OPERATION_LOCK:-/run/lock/camera-rpi.operation.lock}"
+TEST_MODE="${CAMERA_RPI_ADMIN_TEST_MODE:-0}"
+ROOT_RW_OWNED=0
+LOCK_FD=""
+STAGING_DIR=""
+
+admin_fail() {
+  printf 'ERROR\t%s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  local result="${1:-$?}"
+  trap - EXIT HUP INT TERM
+  if (( ROOT_RW_OWNED == 1 )); then
+    sync
+    "$MOUNT_BIN" -o remount,ro / >/dev/null 2>&1 || result=1
+  fi
+  if [[ -n "$LOCK_FD" ]]; then
+    "$FLOCK_BIN" -u "$LOCK_FD" 2>/dev/null || true
+  fi
+  [[ -z "$STAGING_DIR" ]] || rm -rf -- "$STAGING_DIR"
+  exit "$result"
+}
+trap cleanup EXIT HUP INT TERM
+
+if (( EUID != 0 )) && [[ "$TEST_MODE" != "1" ]]; then
+  admin_fail "Die Admin-Bruecke muss als root laufen"
+fi
+
+declare -A INPUT=()
+line_number=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  ((line_number += 1))
+  (( line_number <= 32 && ${#line} <= 8192 )) || admin_fail "Eingabe zu gross"
+  line="${line%$'\r'}"
+  [[ "$line" == *=* ]] || admin_fail "Eingabezeile $line_number ist ungueltig"
+  name="${line%%=*}"
+  value="${line#*=}"
+  [[ "$name" =~ ^[a-z_]+$ ]] || admin_fail "Ungueltiger Feldname"
+  [[ -z "${INPUT[$name]+x}" ]] || admin_fail "Feld $name ist doppelt"
+  case "$name" in
+    action|server_id|server_base_url|camera_slug|enabled|upload_mode|key_mode|key|capture_backend|gphoto_capture_mode|video_device|video_width|video_height|video_warmup_frames|source_json|focus_mode|climate_json|gpio_json|privacy_json|power_json) ;;
+    *) admin_fail "Unbekanntes Feld: $name" ;;
+  esac
+  INPUT[$name]="$value"
+done
+unset line value
+
+ACTION="${INPUT[action]:-}"
+SERVER_ID_INPUT="${INPUT[server_id]:-}"
+
+valid_server_id() {
+  [[ "$1" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ && ${#1} -le 48 ]]
+}
+
+require_server_id() {
+  valid_server_id "$SERVER_ID_INPUT" || admin_fail "Interner Name (Server-ID): 1 bis 48 Zeichen, nur Kleinbuchstaben (a-z), Zahlen und Bindestriche; kein Bindestrich am Anfang oder Ende"
+}
+
+config_path_for_id() {
+  printf '%s/%s.conf' "$CONFIG_DIR" "$1"
+}
+
+key_path_for_id() {
+  printf '%s/%s.key' "$KEY_DIR" "$1"
+}
+
+begin_write_window() {
+  mkdir -p -- "$(dirname -- "$OPERATION_LOCK")"
+  exec {LOCK_FD}>"$OPERATION_LOCK"
+  # Saving even a disabled target needs the shared RO/RW window. Allow a
+  # normal camera exposure/download to finish without interrupting its worker.
+  "$FLOCK_BIN" -w 60 "$LOCK_FD" || admin_fail "Kamera-Sperre ist belegt"
+  if [[ "$TEST_MODE" != "1" ]]; then
+    options="$($FINDMNT_BIN -n -o OPTIONS -T /)" \
+      || admin_fail "Mount-Status ist nicht lesbar"
+    if [[ ",$options," == *,ro,* ]]; then
+      "$MOUNT_BIN" -o remount,rw / \
+        || admin_fail "Root-Dateisystem kann nicht rw gesetzt werden"
+      ROOT_RW_OWNED=1
+    fi
+  fi
+  mkdir -p -- "$CONFIG_DIR" "$KEY_DIR" || admin_fail "Konfigurationsverzeichnis nicht anlegbar"
+  chmod 0700 "$CONFIG_DIR" "$KEY_DIR" || admin_fail "Verzeichnisrechte nicht setzbar"
+}
+
+end_write_window() {
+  local result=0
+  if (( ROOT_RW_OWNED == 1 )); then
+    sync
+    if "$MOUNT_BIN" -o remount,ro /; then
+      ROOT_RW_OWNED=0
+    else
+      printf 'ERROR\tKRITISCH: Root-Dateisystem blieb schreibbar\n' >&2
+      result=1
+    fi
+  fi
+  "$FLOCK_BIN" -u "$LOCK_FD" 2>/dev/null || true
+  exec {LOCK_FD}>&-
+  LOCK_FD=""
+  return "$result"
+}
+
+count_files() {
+  local directory="$1"
+  local suffix="$2"
+  local item
+  local count=0
+  shopt -s nullglob
+  for item in "$directory"/*"$suffix"; do ((count += 1)); done
+  shopt -u nullglob
+  printf '%s' "$count"
+}
+
+read_status_value() {
+  local file="$1"
+  local wanted="$2"
+  local status_line
+  while IFS= read -r status_line || [[ -n "$status_line" ]]; do
+    [[ "${status_line%%=*}" == "$wanted" ]] || continue
+    printf '%s' "${status_line#*=}"
+    return 0
+  done < "$file"
+}
+
+# Nur freigegebene lokale Formular-/Statuswerte ausgeben; Keyinhalt bleibt verborgen.
+list_servers() {
+  local config
+  local state
+  local message
+  local updated
+  local active
+  local requests
+  local runtime_requests
+  local images
+  local status_file
+  local effective_mode server_mode pool_source pool_lib
+  pool_lib="$(dirname -- "$COMMON_LIB")/camera-rpi-pool.sh"
+  [[ ! -r "$pool_lib" ]] || source "$pool_lib"
+
+  printf 'server_id\tserver_base_url\tcamera_slug\tenabled\tupload_mode\tstate\tupdated_epoch\tmessage\trequests\timages\tactive\tcapture_backend\tvideo_device\tvideo_width\tvideo_height\tvideo_warmup_frames\teffective_upload_mode\tserver_upload_mode\tgphoto_capture_mode\tcapture_source_server\tsource_configured\n'
+  shopt -s nullglob
+  for config in "$CONFIG_DIR"/*.conf; do
+    if ! cr_load_server_config "$config" >/dev/null 2>&1; then
+      id="$(basename -- "$config" .conf)"
+      printf '%s\t\t\t0\tlegacy\tinvalid\t0\tKonfiguration ist ungueltig\t0\t0\tunknown\tgphoto2\t/dev/video0\t1920\t1080\t15\tlegacy\tlocal\tstandard\t-\t0\n' "$id"
+      continue
+    fi
+    # Report effective shared camera options, never another target's URL/key.
+    pool_source='-'
+    if declare -F cr_pool_load >/dev/null && cr_pool_load >/dev/null 2>&1; then
+      pool_source="${POOL_SOURCE_SERVER:--}"
+    fi
+    cr_source_load >/dev/null 2>&1 || admin_fail "Gemeinsame Quellkonfiguration ist ungueltig"
+    status_file="$SERVER_RUNTIME_DIR/status"
+    state="stopped"
+    message="Noch kein Laufzeitstatus"
+    updated="0"
+    effective_mode="$UPLOAD_MODE"
+    server_mode=local
+    if [[ -r "$status_file" ]]; then
+      state="$(read_status_value "$status_file" state)"
+      message="$(read_status_value "$status_file" message)"
+      updated="$(read_status_value "$status_file" updated_epoch)"
+      effective_mode="$(read_status_value "$status_file" effective_upload_mode)"
+      server_mode="$(read_status_value "$status_file" server_upload_mode)"
+    fi
+    case "$effective_mode" in legacy|chunked) ;; *) effective_mode="$UPLOAD_MODE" ;; esac
+    case "$server_mode" in local|legacy|chunked) ;; *) server_mode=local ;; esac
+    message="${message//$'\t'/ }"
+    message="${message//$'\n'/ }"
+    requests="$(count_files "$SERVER_SPOOL_DIR/requests" .request)"
+    runtime_requests="$(count_files "$SERVER_RUNTIME_DIR" .pending)"
+    requests=$((requests + runtime_requests))
+    images="$(count_files "$SERVER_SPOOL_DIR/images" .jpg)"
+    if [[ "$TEST_MODE" == "1" ]]; then
+      active="unknown"
+    elif "$SYSTEMCTL_BIN" is-active --quiet "camera-rpi-worker@$SERVER_ID.service"; then
+      active="active"
+    else
+      active="inactive"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$SERVER_ID" "$SERVER_BASE_URL" "$CAMERA_SLUG" "$ENABLED" "$UPLOAD_MODE" \
+      "$state" "$updated" "$message" "$requests" "$images" "$active" \
+      "$CAPTURE_BACKEND" "$VIDEO_DEVICE" "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_WARMUP_FRAMES" \
+      "$effective_mode" "$server_mode" "$GPHOTO_CAPTURE_MODE" "$pool_source" "${SOURCE_CONFIGURED:-0}"
+  done
+  shopt -u nullglob
+}
+
+validate_one() {
+  require_server_id
+  config_path="$(config_path_for_id "$SERVER_ID_INPUT")"
+  [[ -f "$config_path" ]] || admin_fail "Server ist nicht vorhanden"
+  cr_load_server_config "$config_path" >/dev/null \
+    || admin_fail "Konfiguration oder Key ist ungueltig"
+  printf 'OK\tKonfiguration und Key sind gueltig\n'
+}
+
+# Fixed journal scope: never accept a unit name, file path, line count or
+# journal arguments from HTTP. Bound time/output and redact this target's key.
+logs_one() {
+  require_server_id
+  local config_path output journal_bin=/usr/bin/journalctl
+  config_path="$(config_path_for_id "$SERVER_ID_INPUT")"
+  [[ -f "$config_path" ]] || admin_fail 'Server ist nicht vorhanden'
+  # The unit is derived only from the validated ID. Broken config must still
+  # permit diagnosis; key redaction is best effort if the config cannot load.
+  if [[ "$TEST_MODE" == 1 ]]; then journal_bin="${CAMERA_RPI_JOURNAL_BIN:-$journal_bin}"; fi
+  output="$(
+    set +e
+    /usr/bin/timeout --signal=TERM --kill-after=1 5 "$journal_bin" \
+      --unit="camera-rpi-worker@$SERVER_ID_INPUT.service" --lines=10 --no-pager --quiet --output=short-iso \
+      | head -c 32768
+    rc="${PIPESTATUS[0]}"
+    [[ "$rc" == 0 || "$rc" == 141 ]]
+  )" || admin_fail 'Journal konnte nicht gelesen werden (Zeitlimit oder Berechtigung)'
+  if cr_load_server_config "$config_path" >/dev/null 2>&1 && cr_read_secret "$KEY_FILE" >/dev/null 2>&1; then
+    output="${output//"$CR_SECRET"/[KEY AUSGEBLENDET]}"
+    unset CR_SECRET
+  fi
+  printf '%s\n' "$output"
+}
+
+# Eingaben und ggf. beibehaltenen Key vor Installation validieren; Schreibfenster
+# und gemeinsamer Operationslock schuetzen den RO-Betrieb und andere Zielworker.
+# Caller holds the write window. Verify persistent boot activation separately
+# from runtime start: a running unit alone does not prove reboot persistence.
+# Never report success after systemctl fails (this bridge does not use set -e).
+# Apache PrivateTmp creates a separate mount namespace. --root=/ makes unit
+# symlink writes local to our RW window instead of delegating them to PID 1,
+# whose root mount may still be RO. Runtime commands still use the manager.
+apply_server_activation() {
+  local desired="$1" restart_existing="${2:-0}" unit state
+  unit="camera-rpi-worker@$SERVER_ID_INPUT.service"
+  if (( desired == 1 )); then
+    "$SYSTEMCTL_BIN" --root=/ enable "$unit" \
+      || admin_fail "Konfiguration gespeichert, Autostart konnte nicht aktiviert werden"
+    state="$("$SYSTEMCTL_BIN" --root=/ is-enabled "$unit")" \
+      || admin_fail "Konfiguration gespeichert, Autostart-Pruefung fehlgeschlagen"
+    [[ "$state" == enabled ]] \
+      || admin_fail "Konfiguration gespeichert, dauerhafter Autostart nicht bestaetigt ($state)"
+    "$SYSTEMCTL_BIN" daemon-reload \
+      || admin_fail "Autostart gespeichert, systemd-Neuladen fehlgeschlagen"
+    if (( restart_existing == 1 )); then
+      "$SYSTEMCTL_BIN" restart "$unit" \
+        || admin_fail "Autostart aktiv, Worker-Neustart fehlgeschlagen"
+    else
+      "$SYSTEMCTL_BIN" start "$unit" \
+        || admin_fail "Autostart aktiv, Worker-Start fehlgeschlagen"
+    fi
+  else
+    "$SYSTEMCTL_BIN" --root=/ disable "$unit" \
+      || admin_fail "Konfiguration gespeichert, Worker/Autostart konnte nicht deaktiviert werden"
+    # is-enabled returns nonzero for the expected disabled state.
+    state="$("$SYSTEMCTL_BIN" --root=/ is-enabled "$unit" 2>/dev/null)" || true
+    [[ "$state" == disabled ]] \
+      || admin_fail "Konfiguration gespeichert, deaktivierter Autostart nicht bestaetigt ($state)"
+    "$SYSTEMCTL_BIN" daemon-reload \
+      || admin_fail "Autostart deaktiviert, systemd-Neuladen fehlgeschlagen"
+    "$SYSTEMCTL_BIN" stop "$unit" \
+      || admin_fail "Autostart deaktiviert, Worker konnte nicht gestoppt werden"
+  fi
+}
+
+save_server() {
+  require_server_id
+  local input_url="${INPUT[server_base_url]:-}"
+  local input_slug="${INPUT[camera_slug]:-}"
+  local input_enabled="${INPUT[enabled]:-true}"
+  local input_upload_mode="${INPUT[upload_mode]:-}"
+  local key_mode="${INPUT[key_mode]:-keep}"
+  local input_key="${INPUT[key]:-}"
+  local config_path
+  local key_path
+  local existing=0
+  local staged_key
+  local staged_config
+  local parsed_enabled
+
+  [[ "$input_slug" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ && ${#input_slug} -le 64 ]] \
+    || admin_fail "Webcam-Kennung: 1 bis 64 Zeichen, nur Kleinbuchstaben (a-z), Zahlen und Bindestriche; kein Bindestrich am Anfang oder Ende"
+  parsed_enabled="$(cr_bool "$input_enabled")" \
+    || admin_fail "enabled muss true oder false sein"
+  [[ "$key_mode" == "keep" || "$key_mode" == "replace" ]] \
+    || admin_fail "key_mode ist ungueltig"
+
+  config_path="$(config_path_for_id "$SERVER_ID_INPUT")"
+  key_path="$(key_path_for_id "$SERVER_ID_INPUT")"
+  [[ -f "$config_path" ]] && existing=1
+  if (( existing == 1 )); then
+    cr_load_server_config "$config_path" >/dev/null \
+      || admin_fail "Bestehende Konfiguration ist ungueltig und wird nicht ueberschrieben"
+  else
+    # Dieselben Defaults wie in der gemeinsamen Bibliothek. Eine neue Datei
+    # bleibt dadurch kurz und spaetere Defaults koennen zentral greifen.
+    POLL_SECONDS=5
+    ERROR_BACKOFF_SECONDS=20
+    CONNECT_TIMEOUT_SECONDS=10
+    COMMAND_TIMEOUT_SECONDS=30
+    UPLOAD_TIMEOUT_SECONDS=90
+    UPLOAD_MODE="legacy"
+    UPLOAD_CHUNK_BYTES=262144
+    GPHOTO_TIMEOUT_SECONDS=120
+    CAPTURE_BACKEND=gphoto2
+    GPHOTO_CAPTURE_MODE=eos-legacy
+    VIDEO_DEVICE=/dev/video0
+    VIDEO_WIDTH=1920
+    VIDEO_HEIGHT=1080
+    VIDEO_WARMUP_FRAMES=15
+    OPERATION_LOCK_TIMEOUT_SECONDS=900
+    MAX_COMMAND_AGE_SECONDS=900
+    MAX_COMMAND_FUTURE_SECONDS=300
+    MIN_IMAGE_BYTES=1024
+    MAX_IMAGE_BYTES=26214400
+    MANAGE_ROOT_MOUNT=1
+    SPOOL_ROOT="/var/lib/camera-rpi/spool"
+    RUNTIME_ROOT="$RUNTIME_ROOT_DEFAULT"
+    CA_CERT=""
+  fi
+  [[ -n "$input_upload_mode" ]] || input_upload_mode="$UPLOAD_MODE"
+  [[ "$input_upload_mode" == "legacy" || "$input_upload_mode" == "chunked" ]] \
+    || admin_fail "upload_mode muss legacy oder chunked sein"
+  # Fehlende Felder alter Clients erhalten vorhandene Einstellungen.
+  if [[ -e "${CAMERA_RPI_SOURCE_CONFIG:-/etc/camera-rpi/camera-source.conf}" ]]; then
+    ( cr_source_load ) >/dev/null 2>&1 || admin_fail "Gemeinsame Quellkonfiguration ist ungueltig"
+  else
+    CAPTURE_BACKEND="${INPUT[capture_backend]:-$CAPTURE_BACKEND}"
+    GPHOTO_CAPTURE_MODE="${INPUT[gphoto_capture_mode]:-$GPHOTO_CAPTURE_MODE}"
+    VIDEO_DEVICE="${INPUT[video_device]:-$VIDEO_DEVICE}"
+    VIDEO_WIDTH="${INPUT[video_width]:-$VIDEO_WIDTH}"
+    VIDEO_HEIGHT="${INPUT[video_height]:-$VIDEO_HEIGHT}"
+    VIDEO_WARMUP_FRAMES="${INPUT[video_warmup_frames]:-$VIDEO_WARMUP_FRAMES}"
+  fi
+  cr_validate_capture_config >/dev/null || admin_fail "Ungueltige Kameraeinstellungen"
+
+  STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/camera-rpi-admin.XXXXXX")" \
+    || admin_fail "Temporäres Verzeichnis kann nicht angelegt werden"
+  chmod 0700 "$STAGING_DIR" || admin_fail "Staging-Rechte nicht setzbar"
+  staged_key="$STAGING_DIR/server.key"
+  staged_config="$STAGING_DIR/server.conf"
+
+  if [[ "$key_mode" == "replace" ]]; then
+    [[ "$input_key" =~ ^[A-Za-z0-9._~+/=-]{4,512}$ ]] \
+      || admin_fail "Der neue Key hat ein ungueltiges Format"
+    printf '%s\n' "$input_key" > "$staged_key" || admin_fail "Key nicht vorbereitbar"
+    unset input_key 'INPUT[key]'
+  elif (( existing == 1 )); then
+    cr_read_secret "$KEY_FILE" || admin_fail "Bestehender Key ist ungueltig"
+    key_path="$KEY_FILE"
+    printf '%s\n' "$CR_SECRET" > "$staged_key" || admin_fail "Key nicht vorbereitbar"
+    unset CR_SECRET
+  else
+    admin_fail "Ein neuer Server benoetigt einen Key"
+  fi
+  chmod 0600 "$staged_key" || admin_fail "Key-Rechte nicht setzbar"
+
+  # Zur Validierung verweist die Staging-Konfiguration kurz auf den
+  # Staging-Key. In der endgueltigen Datei wird nur dieser Pfad ersetzt.
+  (
+    set -e
+    printf 'server_id=%s\n' "$SERVER_ID_INPUT"
+    printf 'server_base_url=%s\n' "$input_url"
+    printf 'camera_slug=%s\n' "$input_slug"
+    printf 'key_file=%s\n' "$staged_key"
+    printf 'enabled=%s\n' "$parsed_enabled"
+    printf 'poll_seconds=%s\n' "$POLL_SECONDS"
+    printf 'error_backoff_seconds=%s\n' "$ERROR_BACKOFF_SECONDS"
+    printf 'connect_timeout_seconds=%s\n' "$CONNECT_TIMEOUT_SECONDS"
+    printf 'command_timeout_seconds=%s\n' "$COMMAND_TIMEOUT_SECONDS"
+    printf 'upload_timeout_seconds=%s\n' "$UPLOAD_TIMEOUT_SECONDS"
+    printf 'upload_mode=%s\n' "$input_upload_mode"
+    printf 'upload_chunk_bytes=%s\n' "$UPLOAD_CHUNK_BYTES"
+    printf 'gphoto_timeout_seconds=%s\n' "$GPHOTO_TIMEOUT_SECONDS"
+    printf 'capture_backend=%s\n' "$CAPTURE_BACKEND"
+    printf 'gphoto_capture_mode=%s\n' "$GPHOTO_CAPTURE_MODE"
+    printf 'video_device=%s\n' "$VIDEO_DEVICE"
+    printf 'video_width=%s\n' "$VIDEO_WIDTH"
+    printf 'video_height=%s\n' "$VIDEO_HEIGHT"
+    printf 'video_warmup_frames=%s\n' "$VIDEO_WARMUP_FRAMES"
+    printf 'operation_lock_timeout_seconds=%s\n' "$OPERATION_LOCK_TIMEOUT_SECONDS"
+    printf 'max_command_age_seconds=%s\n' "$MAX_COMMAND_AGE_SECONDS"
+    printf 'max_command_future_seconds=%s\n' "$MAX_COMMAND_FUTURE_SECONDS"
+    printf 'min_image_bytes=%s\n' "$MIN_IMAGE_BYTES"
+    printf 'max_image_bytes=%s\n' "$MAX_IMAGE_BYTES"
+    printf 'manage_root_mount=%s\n' "$MANAGE_ROOT_MOUNT"
+    printf 'spool_root=%s\n' "$SPOOL_ROOT"
+    printf 'runtime_root=%s\n' "$RUNTIME_ROOT"
+    if [[ -n "$CA_CERT" ]]; then printf 'ca_cert=%s\n' "$CA_CERT"; fi
+  ) > "$staged_config"
+  [[ $? == 0 ]] || admin_fail "Konfiguration nicht vorbereitbar"
+  chmod 0600 "$staged_config" || admin_fail "Konfigurationsrechte nicht setzbar"
+  cr_load_server_config "$staged_config" >/dev/null \
+    || admin_fail "Neue Konfiguration ist ungueltig"
+
+  # Erst nach kompletter Validierung wird das kurze Schreibfenster geoeffnet.
+  # Publish complete files, and restore the previous key on a config failure.
+  # Two separate paths cannot provide a power-loss-atomic transaction.
+  # Gleiche Keywerte sind Betreiberentscheidung. Nur die Datei dieses Ziels
+  # wird gespeichert; keine Vergleiche oder Aenderungen an fremden Key-Dateien.
+  begin_write_window
+  local save_backup="" key_changed=0 key_existed=0 files_committed=0 config_inode=""
+  rollback_server_save() {
+    local rc=$?
+    trap - EXIT HUP INT TERM
+    # A signal can arrive after rename but before the shell sets the flag.
+    if [[ -n "$config_inode" && "$config_inode" == "$(stat -c '%d:%i' "$config_path" 2>/dev/null)" ]]; then
+      files_committed=1
+    fi
+    if (( key_changed && ! files_committed )); then
+      if (( key_existed )); then
+        [[ "$save_backup/key" -ef "$key_path" ]] || mv -f -- "$save_backup/key" "$key_path" || {
+          printf 'ERROR\tKey-Ruecknahme fehlgeschlagen; Sicherung: %s/key\n' "$save_backup" >&2
+          cleanup 1
+        }
+      else
+        rm -f -- "$key_path" || { printf 'ERROR\tKey-Ruecknahme fehlgeschlagen\n' >&2; cleanup 1; }
+      fi
+    fi
+    rm -f -- "$config_path.new"
+    [[ "$key_mode" != replace ]] || rm -f -- "$key_path.new"
+    [[ -z "$save_backup" ]] || rm -rf -- "$save_backup"
+    cleanup "$rc"
+  }
+  trap rollback_server_save EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  if [[ "$key_mode" == "replace" ]]; then
+    save_backup="$(mktemp -d "$KEY_DIR/.save.XXXXXXXX")" || admin_fail "Key-Sicherung nicht anlegbar"
+    if [[ -e "$key_path" ]]; then
+      ln -- "$key_path" "$save_backup/key" || admin_fail "Key-Sicherung fehlgeschlagen"
+      key_existed=1
+    fi
+    install -m 0600 -o root -g root "$staged_key" "$key_path.new" || admin_fail "Key-Schreiben fehlgeschlagen"
+  fi
+  sed "s|^key_file=.*$|key_file=$key_path|" "$staged_config" > "$config_path.new" || admin_fail "Konfigurationsschreiben fehlgeschlagen"
+  chmod 0600 "$config_path.new" || admin_fail "Konfigurationsrechte fehlgeschlagen"
+  chown root:root "$config_path.new" || admin_fail "Konfigurationseigentuemer fehlgeschlagen"
+  config_inode="$(stat -c '%d:%i' "$config_path.new")" || admin_fail "Konfiguration nicht pruefbar"
+  if [[ "$key_mode" == "replace" ]]; then
+    # Mark intent first so interruption immediately after rename also restores.
+    key_changed=1
+    mv -f -- "$key_path.new" "$key_path" || admin_fail "Key-Uebernahme fehlgeschlagen"
+  fi
+  mv -f -- "$config_path.new" "$config_path" || admin_fail "Konfigurationsuebernahme fehlgeschlagen"
+  files_committed=1
+  [[ -z "$save_backup" ]] || rm -rf -- "$save_backup" || admin_fail "Key-Sicherung nicht entfernbar"
+  trap cleanup EXIT HUP INT TERM
+
+  if [[ "$TEST_MODE" != "1" ]]; then
+    "$SYSTEMCTL_BIN" daemon-reload || admin_fail "Konfiguration gespeichert, systemd-Neuladen fehlgeschlagen"
+    # Existing workers need a restart only when their saved settings change.
+    apply_server_activation "$parsed_enabled" "$existing"
+  fi
+  end_write_window || admin_fail "Root-Dateisystem konnte nicht wieder ro gesetzt werden"
+  printf 'OK\tServer %s wurde sicher gespeichert\n' "$SERVER_ID_INPUT"
+}
+
+# One shared camera profile; validate before stopping services or writing /etc.
+save_source() {
+  local helper="$(dirname -- "$COMMON_LIB")/camera-source.php"
+  local profile="${CAMERA_RPI_SOURCE_CONFIG:-/etc/camera-rpi/camera-source.conf}"
+  local existed=0 units=() unit rest
+  [[ -n "${INPUT[source_json]:-}" ]] || admin_fail 'Quelleneinstellungen fehlen'
+  STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/camera-source-admin.XXXXXXXX")" || admin_fail 'Vorbereitung fehlgeschlagen'
+  printf '%s' "${INPUT[source_json]}" | /usr/bin/php "$helper" prepare "$STAGING_DIR/source.conf" || admin_fail 'Quelleneinstellungen ungueltig'
+  begin_write_window
+  if [[ -e "$profile" || -L "$profile" ]]; then
+    /usr/bin/php "$helper" check >/dev/null || admin_fail 'Bestehendes Quellenprofil ungueltig'
+    cp -p "$profile" "$STAGING_DIR/previous.conf" || admin_fail 'Sicherung fehlgeschlagen'
+    existed=1
+  fi
+  if [[ "$TEST_MODE" != 1 ]]; then
+    local unit_list
+    unit_list="$("$SYSTEMCTL_BIN" list-units --type=service --state=active --no-legend --plain 'camera-rpi-worker@*.service' 'camera-rpi-video.service')" || admin_fail 'Dienstliste nicht lesbar'
+    while read -r unit rest; do
+      [[ -z "$unit" ]] && continue
+      [[ "$unit" == camera-rpi-video.service || "$unit" =~ ^camera-rpi-worker@[a-z0-9-]+\.service$ ]] || admin_fail 'Ungueltige Dienstliste'
+      units+=("$unit")
+    done <<< "$unit_list"
+  fi
+  rollback_source() {
+    local rc=$?
+    trap - EXIT HUP INT TERM
+    (( ${#units[@]} == 0 )) || "$SYSTEMCTL_BIN" stop "${units[@]}" || true
+    if (( existed )); then
+      install -m 0600 "$STAGING_DIR/previous.conf" "$profile.restore" && mv -f "$profile.restore" "$profile"
+    else
+      rm -f -- "$profile"
+    fi
+    sync -f "$(dirname -- "$profile")"
+    (( ${#units[@]} == 0 )) || "$SYSTEMCTL_BIN" start "${units[@]}" || true
+    cleanup "$rc"
+  }
+  trap rollback_source EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  if (( ${#units[@]} )); then "$SYSTEMCTL_BIN" stop "${units[@]}" || exit 1; fi
+  install -m 0600 -o root -g root "$STAGING_DIR/source.conf" "$profile.new" || exit 1
+  sync -f "$profile.new" || exit 1
+  mv -f "$profile.new" "$profile" || exit 1
+  sync -f "$(dirname -- "$profile")" || exit 1
+  cmp "$STAGING_DIR/source.conf" "$profile" || exit 1
+  /usr/bin/php "$helper" check >/dev/null || exit 1
+  if (( ${#units[@]} )); then "$SYSTEMCTL_BIN" start "${units[@]}" || exit 1; fi
+  trap cleanup EXIT HUP INT TERM
+  end_write_window || admin_fail 'Root-Dateisystem konnte nicht wieder ro gesetzt werden'
+  printf 'OK\tAufnahmequelle gespeichert und uebernommen\n'
+}
+
+set_enabled() {
+  require_server_id
+  local desired="${INPUT[enabled]:-}"
+  local parsed
+  local config_path
+  local temporary
+  parsed="$(cr_bool "$desired")" || admin_fail "enabled muss true oder false sein"
+  config_path="$(config_path_for_id "$SERVER_ID_INPUT")"
+  cr_load_server_config "$config_path" >/dev/null || admin_fail "Server ist ungueltig"
+
+  begin_write_window
+  temporary="$config_path.new"
+  if ! { awk -v value="$parsed" '
+    BEGIN { found=0 }
+    /^enabled=/ { print "enabled=" value; found=1; next }
+    { print }
+    END { if (!found) print "enabled=" value }
+  ' "$config_path" > "$temporary" \
+    && chmod 0600 "$temporary" \
+    && chown root:root "$temporary" \
+    && mv -f -- "$temporary" "$config_path"; }; then
+    rm -f -- "$temporary"
+    admin_fail "Statusspeicherung fehlgeschlagen"
+  fi
+  if [[ "$TEST_MODE" != "1" ]]; then
+    apply_server_activation "$parsed"
+  fi
+  end_write_window || admin_fail "Root-Dateisystem konnte nicht wieder ro gesetzt werden"
+  printf 'OK\tServerstatus wurde geaendert\n'
+}
+
+restart_server() {
+  require_server_id
+  config_path="$(config_path_for_id "$SERVER_ID_INPUT")"
+  cr_load_server_config "$config_path" >/dev/null || admin_fail "Server ist ungueltig"
+  [[ "$TEST_MODE" == "1" ]] \
+    || "$SYSTEMCTL_BIN" restart "camera-rpi-worker@$SERVER_ID_INPUT.service" \
+    || admin_fail "Worker-Neustart fehlgeschlagen"
+  printf 'OK\tWorker wurde neu gestartet\n'
+}
+
+# Nur den gewaehlten Worker per RAM-Auftrag anstossen, keine Aufnahme im Webrequest.
+capture_server() {
+  if [[ -e "${CAMERA_RPI_PRIVACY_CONFIG:-/etc/camera-rpi/privacy.json}" ]]; then
+    /usr/bin/php "$PRIVACY_HELPER" check || admin_fail "Aufnahme durch Aufnahmefenster gesperrt (Details unter Aufnahmeschutz)"
+  fi
+  require_server_id
+  cr_load_server_config "$(config_path_for_id "$SERVER_ID_INPUT")" >/dev/null \
+    || admin_fail "Server ist ungueltig"
+  (( ENABLED == 1 )) || admin_fail "Worker ist deaktiviert"
+  if [[ "$TEST_MODE" != 1 ]]; then
+    "$SYSTEMCTL_BIN" is-active --quiet "camera-rpi-worker@$SERVER_ID_INPUT.service" \
+      || admin_fail "Worker laeuft nicht"
+  fi
+  mkdir -p -- "$SERVER_RUNTIME_DIR" || admin_fail "Laufzeitverzeichnis fehlt"
+  chmod 0700 "$RUNTIME_ROOT" "$SERVER_RUNTIME_DIR"
+  local manual_fd now last=0 item
+  exec {manual_fd}>"$SERVER_RUNTIME_DIR/manual.lock"
+  "$FLOCK_BIN" -n "$manual_fd" || admin_fail "Auftrag wird gerade uebernommen"
+  [[ ! -e "$SERVER_RUNTIME_DIR/manual.request" ]] || admin_fail "Aufnahme ist bereits vorgemerkt"
+  for item in "$SERVER_RUNTIME_DIR"/*.pending "$SERVER_SPOOL_DIR/requests"/*.request "$SERVER_SPOOL_DIR/images"/*.jpg; do
+    [[ ! -e "$item" ]] || admin_fail "Zuerst wartende Aufnahme/Upload abschliessen"
+  done
+  now="$(date +%s)"
+  if [[ -f "$SERVER_RUNTIME_DIR/manual.last" ]]; then
+    read -r last < "$SERVER_RUNTIME_DIR/manual.last" || true
+    [[ "$last" =~ ^[0-9]{10}$ ]] || admin_fail "Ungueltiger manueller Aufnahmestatus"
+  fi
+  (( now - last >= 30 )) || admin_fail "Bitte mindestens 30 Sekunden zwischen Aufnahmen warten"
+  printf '%s\n' "$now" > "$SERVER_RUNTIME_DIR/manual.last" || admin_fail "Status nicht speicherbar"
+  printf '%s\n' "$now" > "$SERVER_RUNTIME_DIR/manual.request.tmp.$$" \
+    && mv -f -- "$SERVER_RUNTIME_DIR/manual.request.tmp.$$" "$SERVER_RUNTIME_DIR/manual.request" \
+    || admin_fail "Auftrag nicht speicherbar"
+  "$FLOCK_BIN" -u "$manual_fd"
+  exec {manual_fd}>&-
+  printf 'OK\tAufnahme nur fuer %s vorgemerkt\n' "$SERVER_ID_INPUT"
+}
+
+# Erlaubte Fokusaktion fuer dieses Ziel vormerken; die gemeinsame physische Kamera
+# bewegt spaeter ausschliesslich der gphoto2-Worker unter seinem Operationslock.
+focus_server() {
+  require_server_id
+  cr_load_server_config "$(config_path_for_id "$SERVER_ID_INPUT")" >/dev/null || admin_fail "Server ist ungueltig"
+  (( ENABLED == 1 )) || admin_fail "Worker ist deaktiviert"
+  [[ "$CAPTURE_BACKEND" == gphoto2 ]] || admin_fail "Fokus ist nur fuer gphoto2 verfuegbar"
+  local mode="${INPUT[focus_mode]:-}" focus_fd now last=0
+  cr_focus_mode_valid "$mode" || admin_fail "Ungueltiger Fokusmodus"
+  [[ "$TEST_MODE" == 1 ]] || "$SYSTEMCTL_BIN" is-active --quiet "camera-rpi-worker@$SERVER_ID_INPUT.service" || admin_fail "Worker laeuft nicht"
+  mkdir -p -- "$SERVER_RUNTIME_DIR" || admin_fail "Laufzeitverzeichnis fehlt"
+  chmod 0700 "$RUNTIME_ROOT" "$SERVER_RUNTIME_DIR"
+  exec {focus_fd}>"$SERVER_RUNTIME_DIR/focus.lock"
+  "$FLOCK_BIN" -n "$focus_fd" || admin_fail "Fokus wird gerade bearbeitet"
+  [[ ! -e "$SERVER_RUNTIME_DIR/focus.request" ]] || admin_fail "Fokus ist bereits vorgemerkt"
+  now="$(date +%s)"
+  if [[ -f "$SERVER_RUNTIME_DIR/focus.last-local" ]]; then
+    read -r last < "$SERVER_RUNTIME_DIR/focus.last-local" || true
+    [[ "$last" =~ ^[0-9]{10}$ ]] || admin_fail "Fokusstatus ungueltig"
+  fi
+  (( now - last >= 2 )) || admin_fail "Bitte zwei Sekunden zwischen Fokusauftraegen warten"
+  printf '%s\n' "$now" > "$SERVER_RUNTIME_DIR/focus.last-local" || admin_fail "Status nicht speicherbar"
+  printf '%s\n%s\n' "$now" "$mode" > "$SERVER_RUNTIME_DIR/focus.request.tmp.$$" \
+    && mv -f -- "$SERVER_RUNTIME_DIR/focus.request.tmp.$$" "$SERVER_RUNTIME_DIR/focus.request" || admin_fail "Fokus nicht speicherbar"
+  "$FLOCK_BIN" -u "$focus_fd"
+  exec {focus_fd}>&-
+  printf 'OK\tFokus fuer %s vorgemerkt; Ausfuehrung nach laufendem Poll\n' "$SERVER_ID_INPUT"
+}
+
+# Device-wide climate settings use a separate fixed file, not a server config
+# or secret. The existing global lock/RO write window protects its atomic CAS.
+save_climate() {
+  [[ -n "${INPUT[climate_json]:-}" ]] || admin_fail "Klima-Eingabe fehlt"
+  begin_write_window
+  if ! printf '%s' "${INPUT[climate_json]}" | /usr/bin/php "$CLIMATE_HELPER" save; then
+    end_write_window || true
+    admin_fail "Klima-Konfiguration nicht gespeichert (siehe Pruefmeldung)"
+  fi
+  end_write_window || admin_fail "Root-Dateisystem konnte nicht wieder ro gesetzt werden"
+}
+
+case "$ACTION" in
+  power_status|power_on|power_off)
+    /usr/bin/php "$POWER_HELPER" "$ACTION" || admin_fail "Kamerastrom-Aktion fehlgeschlagen"
+    ;;
+  power_save)
+    [[ -n "${INPUT[power_json]:-}" ]] || admin_fail "Reset-Einstellung fehlt"
+    begin_write_window
+    if ! printf '%s' "${INPUT[power_json]}" | /usr/bin/php "$POWER_HELPER" power_save; then
+      end_write_window || true
+      admin_fail "Reset-Einstellung nicht gespeichert"
+    fi
+    end_write_window || admin_fail "Root konnte nicht wieder ro gesetzt werden"
+    ;;
+  privacy_get) /usr/bin/php "$PRIVACY_HELPER" get || admin_fail "Aufnahmeschutz nicht lesbar" ;;
+  privacy_save)
+    [[ -n "${INPUT[privacy_json]:-}" ]] || admin_fail "Aufnahmeoptionen fehlen"
+    begin_write_window
+    if ! printf '%s' "${INPUT[privacy_json]}" | /usr/bin/php "$PRIVACY_HELPER" save; then
+      end_write_window || true
+      admin_fail "Aufnahmeoptionen nicht gespeichert"
+    fi
+    end_write_window || admin_fail "Root konnte nicht wieder ro gesetzt werden"
+    ;;
+  gpio_get) /usr/bin/php "$GPIO_HELPER" get || admin_fail "GPIO-Konfiguration nicht lesbar" ;;
+  gpio_save)
+    # Only the pending document changes; no overlay/service action here.
+    [[ -n "${INPUT[gpio_json]:-}" ]] || admin_fail "GPIO-Eingabe fehlt"
+    begin_write_window
+    if ! printf '%s' "${INPUT[gpio_json]}" | /usr/bin/php "$GPIO_HELPER" save; then
+      end_write_window || true
+      admin_fail "GPIO-Belegung nicht gespeichert"
+    fi
+    end_write_window || admin_fail "Root konnte nicht wieder ro gesetzt werden"
+    ;;
+  climate_get) /usr/bin/php "$CLIMATE_HELPER" get || admin_fail "Klima-Konfiguration nicht lesbar" ;;
+  climate_save) save_climate ;;
+  climate_reset) /usr/bin/php "$CLIMATE_HELPER" reset || admin_fail "Quittierung nicht moeglich" ;;
+  source_devices) /usr/bin/php "$(dirname -- "$COMMON_LIB")/camera-source.php" devices ;;
+  source_get) /usr/bin/php "$(dirname -- "$COMMON_LIB")/camera-source.php" get ;;
+  source_save) save_source ;;
+  list) list_servers ;;
+  validate) validate_one ;;
+  logs) logs_one ;;
+  save) save_server ;;
+  set_enabled) set_enabled ;;
+  restart) restart_server ;;
+  capture) capture_server ;;
+  focus) focus_server ;;
+  *) admin_fail "Unbekannte oder fehlende Aktion" ;;
+esac

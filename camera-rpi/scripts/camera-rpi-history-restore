@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Boot-only history restore, before sensor/controller startup. Do not restore
+# live status or control state. Both independent archives get a restore attempt.
+set -euo pipefail
+result=0
+/usr/bin/python3 -B /usr/local/libexec/camera-rpi-sensor-archive.py restore || result=1
+if [[ -f /usr/local/libexec/camera-rpi-climate-archive.php ]]; then
+  /usr/bin/php -d opcache.enable_cli=0 -d opcache.file_cache= /usr/local/libexec/camera-rpi-climate-archive.php restore || result=1
+fi
+exit "$result"

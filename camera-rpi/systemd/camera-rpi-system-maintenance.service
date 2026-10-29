@@ -1,0 +1,23 @@
+[Unit]
+Description=Serialized camera system maintenance with temporary RW mounts
+After=local-fs.target network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/camera-rpi-system-maintenance
+ExecStart=/usr/local/libexec/camera-rpi-system-maintenance run
+ExecStopPost=/usr/local/libexec/camera-rpi-system-maintenance restore
+RuntimeDirectory=camera-rpi-system-maintenance
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=30min
+TimeoutStopSec=5min
+KillMode=control-group
+# No private mount namespace: the shared real mounts must return to RO.
+StandardOutput=journal
+StandardError=journal

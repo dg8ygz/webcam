@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Fault injection into private config/key files. No services or mounts.
+set -euo pipefail
+umask 077
+repo=$(cd "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d "${TMPDIR:-/tmp}/camera-admin-writes.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+mkdir -p "$stage/servers" "$stage/keys" "$stage/run" "$stage/bin"
+for command in install sed chmod chown mv; do
+  cat > "$stage/bin/$command" <<'SH'
+#!/usr/bin/env bash
+name=${0##*/}
+last=${!#}
+if [[ "$name" == "${FAULT_COMMAND:-}" ]]; then
+  case "${FAULT_TARGET:-}:$last" in
+    key-signal:*.key|config-signal:*.conf)
+      if [[ ! -f "$FAULT_MARKER" ]]; then
+        : > "$FAULT_MARKER"
+        "/usr/bin/$name" "$@" || exit $?
+        kill -TERM "$PPID"
+        exit 0
+      fi ;;
+  esac
+  case "${FAULT_TARGET:-}:$last" in
+    config:*.conf.new|config:*/server.conf|config-rename:*.conf|key:*.key.new|key-rename:*.key)
+      # A rollback must still work after the injected one-shot failure.
+      if [[ ! -f "$FAULT_MARKER" ]]; then
+        : > "$FAULT_MARKER"
+        printf 'simulated I/O failure\n' >&2
+        exit 73
+      fi ;;
+  esac
+fi
+exec "/usr/bin/$name" "$@"
+SH
+  chmod 0700 "$stage/bin/$command"
+done
+run() {
+  env PATH="$stage/bin:$PATH" FAULT_COMMAND="${FAULT_COMMAND:-}" FAULT_TARGET="${FAULT_TARGET:-}" \
+    FAULT_MARKER="$stage/fault" CAMERA_RPI_ADMIN_TEST_MODE=1 \
+    CAMERA_RPI_SOURCE_CONFIG="$stage/no-source" CAMERA_RPI_POOL_CONFIG="$stage/no-pool" \
+    CAMERA_RPI_CONFIG_DIR="$stage/servers" CAMERA_RPI_KEY_DIR="$stage/keys" \
+    CAMERA_RPI_RUNTIME_ROOT="$stage/run" CAMERA_RPI_OPERATION_LOCK="$stage/lock" \
+    CAMERA_RPI_COMMON_LIB="$repo/scripts/lib/camera-rpi-common.sh" \
+    bash "$repo/scripts/admin/camera-rpi-admin" > "$stage/out" 2> "$stage/err"
+}
+save() {
+  printf 'action=save\nserver_id=%s\nserver_base_url=https://%s.invalid/webcam\ncamera_slug=fixture\nenabled=false\nkey_mode=replace\nkey=%s\n' "${3:-fixture}" "$1" "$2" | run
+}
+save original original-dummy-key
+cp -p "$stage/servers/fixture.conf" "$stage/original.conf"
+cp -p "$stage/keys/fixture.key" "$stage/original.key"
+checks=0
+for fault in install:key sed:config chmod:config chown:config mv:key-rename mv:config-rename; do
+  export FAULT_COMMAND=${fault%%:*} FAULT_TARGET=${fault#*:}
+  rm -f "$stage/fault"
+  if save changed replacement-dummy-key; then echo "FAIL: accepted $fault"; exit 1; fi
+  test -f "$stage/fault"
+  grep -q '^ERROR' "$stage/err"
+  test ! -s "$stage/out"
+  cmp "$stage/original.conf" "$stage/servers/fixture.conf"
+  cmp "$stage/original.key" "$stage/keys/fixture.key"
+  test ! -e "$stage/servers/fixture.conf.new"
+  test ! -e "$stage/keys/fixture.key.new"
+  flock -n "$stage/lock" true
+  ((checks+=1))
+done
+export FAULT_COMMAND=mv FAULT_TARGET=config-rename
+rm -f "$stage/fault"
+if save changed replacement-dummy-key newtarget; then exit 1; fi
+test ! -e "$stage/servers/newtarget.conf"
+test ! -e "$stage/keys/newtarget.key"
+rm -f "$stage/fault"
+if printf 'action=set_enabled\nserver_id=fixture\nenabled=true\n' | run; then exit 1; fi
+cmp "$stage/original.conf" "$stage/servers/fixture.conf"
+test ! -s "$stage/out"
+test ! -e "$stage/servers/fixture.conf.new"
+export FAULT_TARGET=key-signal
+rm -f "$stage/fault"
+if save changed replacement-dummy-key; then exit 1; fi
+cmp "$stage/original.conf" "$stage/servers/fixture.conf"
+cmp "$stage/original.key" "$stage/keys/fixture.key"
+test ! -s "$stage/out"
+export FAULT_TARGET=config-signal
+rm -f "$stage/fault"
+if save changed replacement-dummy-key; then exit 1; fi
+grep -qx 'server_base_url=https://changed.invalid/webcam' "$stage/servers/fixture.conf"
+grep -qx replacement-dummy-key "$stage/keys/fixture.key"
+test ! -s "$stage/out"
+unset FAULT_COMMAND FAULT_TARGET
+save changed replacement-dummy-key
+grep -qx 'server_base_url=https://changed.invalid/webcam' "$stage/servers/fixture.conf"
+grep -qx replacement-dummy-key "$stage/keys/fixture.key"
+printf 'OK: %s save faults, new target cleanup, activation failure, two commit signals and subsequent successful save\n' "$checks"

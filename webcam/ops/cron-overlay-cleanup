@@ -1,0 +1,8 @@
+# Entfernt woechentlich verwaiste Overlay-Dateien aus cache/<slug>/overlays/.
+# Voraussetzung: WEBCAM_CONFIG_DB zeigt auf die Live-Config-DB.
+#
+# Beispiel fuer /etc/cron.d/webcam-overlay-cleanup:
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+30 3 * * 0 www-data cd /var/www/html/webcam && WEBCAM_CONFIG_DB=/var/lib/webcam/webcams.sqlite php bin/cleanup_overlays.php --delete --verbose >> var/log/cleanup_overlays.log 2>&1

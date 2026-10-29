@@ -1,0 +1,41 @@
+# Pfadspezifische Request-Raten fuer die oeffentlichen Webcam-Uploads.
+#
+# Die Jails lesen nur das bestehende Apache-Access-Log. Sie veraendern weder
+# PHP noch den Request-Body und funktionieren deshalb unabhaengig vom Apache-
+# MPM. Nach Ueberschreitung sperrt die vorhandene nftables-Aktion die Quell-IP
+# fuer zehn Minuten auf HTTP und HTTPS. Localhost bleibt fuer Healthchecks und
+# eine kontrollierte Abnahme ausgenommen; reale Remote-Clients nicht.
+
+[webcam-upload-legacy-rate]
+enabled   = true
+filter    = webcam-upload-legacy-rate
+port      = http,https
+logpath   = /var/log/apache2/access.log
+backend   = auto
+usedns    = no
+ignoreip  = 127.0.0.1/8 ::1
+
+# Ein Komplettbild benoetigt genau eine Anfrage. Zwoelf Versuche in einer
+# Minute lassen kurze Wiederholungen zu, sind fuer normalen Kamerabetrieb aber
+# bereits weit oberhalb des erwarteten Takts.
+findtime  = 60
+maxretry  = 12
+bantime   = 600
+action    = nftables-multiport[name=webcam-upload-legacy-rate, port="80,443"]
+
+[webcam-upload-chunk-rate]
+enabled   = true
+filter    = webcam-upload-chunk-rate
+port      = http,https
+logpath   = /var/log/apache2/access.log
+backend   = auto
+usedns    = no
+ignoreip  = 127.0.0.1/8 ::1
+
+# Die beobachteten Bilder benoetigten bis zu elf Teile. 120 Requests pro
+# Minute lassen mehrere gleichzeitig sendende Kameras und Wiederholungen zu,
+# begrenzen aber dauerhaftes Feuer auf den Chunk-Endpunkt.
+findtime  = 60
+maxretry  = 120
+bantime   = 600
+action    = nftables-multiport[name=webcam-upload-chunk-rate, port="80,443"]

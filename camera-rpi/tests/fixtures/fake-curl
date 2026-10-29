@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+# Curl-Ersatz fuer Tests. Er spricht kein Netz an, prueft aber Header, Ziel-URL
+# und Upload-Datei genau so, wie ein Zielserver sie sehen wuerde.
+
+set -uo pipefail
+
+# Explicit handshake avoids a one-second race on loaded test hosts. The
+# bounded wait still exposes a worker which incorrectly keeps the camera lock.
+slow_upload() {
+  : > "$FAKE_SLOW_UPLOAD_MARKER"
+  if [[ -n "${FAKE_SLOW_UPLOAD_RELEASE:-}" ]]; then
+    for unused in {1..200}; do
+      [[ -e "$FAKE_SLOW_UPLOAD_RELEASE" ]] && break
+      sleep 0.05
+    done
+  else
+    sleep 1
+  fi
+  rm -f -- "$FAKE_SLOW_UPLOAD_MARKER"
+}
+
+output=""
+header_file=""
+upload_file=""
+url=""
+expect_output=0
+expect_dump=0
+dump_file=""
+expect_header=0
+expect_form=0
+expect_form_string=0
+expect_config=0
+declare -A form_values=()
+
+printf '%s\n' "$*" >> "$FAKE_CURL_ARGUMENT_LOG"
+
+for argument in "$@"; do
+  if (( expect_config == 1 )); then
+    if [[ -n "${FAKE_CURL_CONFIG_LOG:-}" ]]; then cat "$argument" >> "$FAKE_CURL_CONFIG_LOG"; fi
+    expect_config=0
+    continue
+  fi
+  if (( expect_dump == 1 )); then dump_file="$argument"; expect_dump=0; continue; fi
+  if (( expect_output == 1 )); then output="$argument"; expect_output=0; continue; fi
+  if (( expect_header == 1 )); then
+    if [[ "$argument" == @* ]]; then header_file="${argument#@}";
+    elif [[ "$argument" == X-Capture-Timestamp:* ]]; then
+      [[ "$argument" =~ ^X-Capture-Timestamp:\ [0-9]{10}$ ]] || exit 1
+    elif [[ "$argument" != *:* ]]; then exit 1; fi
+    expect_header=0; continue
+  fi
+  if (( expect_form == 1 )); then
+    [[ "$argument" == upload=@* ]] && upload_file="${argument#upload=@}"
+    upload_file="${upload_file%%;*}"
+    expect_form=0
+    continue
+  fi
+  if (( expect_form_string == 1 )); then
+    form_name="${argument%%=*}"
+    form_values["$form_name"]="${argument#*=}"
+    expect_form_string=0
+    continue
+  fi
+  case "$argument" in
+    --config) expect_config=1 ;;
+    --output) expect_output=1 ;;
+    --dump-header) expect_dump=1 ;;
+    --header) expect_header=1 ;;
+    --form) expect_form=1 ;;
+    --form-string) expect_form_string=1 ;;
+    http://*|https://*) url="$argument" ;;
+  esac
+done
+
+case "$url" in
+  *server-one.invalid*) expected_key="key-one-111111" ;;
+  *server-two.invalid*) expected_key="key-two-222222" ;;
+  *server-three.invalid*) expected_key="key-three-333333" ;;
+  *) printf '000'; exit 7 ;;
+esac
+
+[[ -r "$header_file" ]] || { printf '403'; exit 0; }
+header="$(<"$header_file")"
+[[ "$header" == *": $expected_key" ]] || { printf '403'; exit 0; }
+
+if [[ "$url" == */include/command.php ]]; then
+  if [[ -n "$dump_file" ]]; then
+    printf 'HTTP/1.1 200 OK\r\n' > "$dump_file"
+    if [[ -n "${FAKE_SERVER_UPLOAD_MODE:-}" ]]; then
+      printf 'X-Camera-Upload-Mode: %s\r\n' "$FAKE_SERVER_UPLOAD_MODE" >> "$dump_file"
+    fi
+    printf '\r\n' >> "$dump_file"
+  fi
+  if [[ "${FAKE_COMMAND_MODE:-capture}" == focus ]]; then
+    printf 'focus\n%s\n%s\n' "$FAKE_CAPTURE_SERIAL" "$FAKE_FOCUS_MODE" > "$output"
+  elif [[ "${FAKE_COMMAND_MODE:-capture}" == "wait" ]]; then
+    printf 'wait\n0\nwait\n' > "$output"
+  elif [[ "${FAKE_COMMAND_MODE:-capture}" == legacy-isoexp ]]; then
+    # Original command.php adds another LF to a LF-terminated command.txt.
+    printf 'command\n%s\nwebcam_isoexp 0 2\n\n' "$FAKE_CAPTURE_SERIAL" > "$output"
+  elif [[ "${FAKE_COMMAND_MODE:-capture}" == legacy-current ]]; then
+    printf 'command\n%s\nwebcam_capture %s\n' "$FAKE_CAPTURE_SERIAL" "$FAKE_LEGACY_STAMP" > "$output"
+  elif [[ "${FAKE_COMMAND_MODE:-capture}" == legacy-capture ]]; then
+    printf 'command\n%s\nwebcam_capture 20260912_2148\n\n' "$FAKE_CAPTURE_SERIAL" > "$output"
+  else
+    printf 'command\n%s\nwebcam_capture\n' "$FAKE_CAPTURE_SERIAL" > "$output"
+  fi
+elif [[ "$url" == */include/upload.php ]]; then
+  [[ -r "$upload_file" ]] || { printf '400'; exit 0; }
+  if [[ -n "${FAKE_EXPECT_LEGACY_STAMP:-}" && "${form_values[now]:-}" != "$FAKE_EXPECT_LEGACY_STAMP" ]]; then
+    printf 'Falscher Legacy-Zeitstempel: %s\n' "${form_values[now]:-missing}" >&2
+    printf '400'
+    exit 0
+  fi
+  if [[ -n "${FAKE_SLOW_UPLOAD_HOST:-}" && "$url" == *"$FAKE_SLOW_UPLOAD_HOST"* ]]; then
+    slow_upload
+  fi
+  if [[ -n "${FAKE_FAIL_UPLOAD_HOST:-}" && "$url" == *"$FAKE_FAIL_UPLOAD_HOST"* ]]; then
+    printf '{"ok":false}\n' > "$output"
+    printf '503'
+    exit 0
+  fi
+  if [[ -n "${FAKE_LEGACY_UPLOAD_BODY_FILE:-}" ]]; then
+    cat "$FAKE_LEGACY_UPLOAD_BODY_FILE" > "$output"
+  else
+    printf '{"ok":true}\n' > "$output"
+  fi
+  printf '%s\t%s\n' "$url" "$upload_file" >> "$FAKE_UPLOAD_LOG"
+elif [[ "$url" == */include/upload-chunk.php ]]; then
+  action="${form_values[action]:-}"
+  if [[ -z "${FAKE_CHUNK_SUPPORT_HOST:-}" || "$url" != *"$FAKE_CHUNK_SUPPORT_HOST"* ]]; then
+    printf '{"ok":false,"error":"not found"}\n' > "$output"
+    printf '404'
+    exit 0
+  fi
+  case "$action" in
+    capabilities)
+      printf '{"ok":true,"protocol":"camera-rpi-chunk-v1","preferred_chunk_bytes":262144}\n' > "$output"
+      ;;
+    chunk)
+      [[ -r "$upload_file" ]] || { printf '400'; exit 0; }
+      actual_chunk_hash="$(sha256sum -- "$upload_file")"
+      actual_chunk_hash="${actual_chunk_hash%% *}"
+      [[ "$actual_chunk_hash" == "${form_values[chunk_sha256]:-}" ]] \
+        || { printf '{"ok":false,"error":"chunk hash mismatch"}\n' > "$output"; printf '422'; exit 0; }
+      printf '{"ok":true,"protocol":"camera-rpi-chunk-v1","upload_id":"%s","chunk_index":%s}\n' \
+        "${form_values[upload_id]:-missing}" "${form_values[chunk_index]:-0}" > "$output"
+      ;;
+    finalize)
+      if [[ -n "${FAKE_SLOT_CONFLICT:-}" ]]; then
+        printf '{"ok":false,"error":"%s","timestamp":%s,"sha256":"%s"}\n' \
+          "$FAKE_SLOT_CONFLICT" "${form_values[now]}" "${form_values[sha256]}" > "$output"
+        printf '409'; exit 0
+      fi
+      if [[ -n "${FAKE_SLOW_UPLOAD_HOST:-}" && "$url" == *"$FAKE_SLOW_UPLOAD_HOST"* ]]; then
+        slow_upload
+      fi
+      if [[ -n "${FAKE_FAIL_UPLOAD_HOST:-}" && "$url" == *"$FAKE_FAIL_UPLOAD_HOST"* ]]; then
+        printf '{"ok":false,"error":"test failure"}\n' > "$output"
+        printf '503'
+        exit 0
+      fi
+      printf '{"ok":true,"protocol":"camera-rpi-chunk-v1","upload_id":"%s"}\n' \
+        "${form_values[upload_id]:-missing}" > "$output"
+      printf '%s\tchunked:%s\n' "$url" "${form_values[upload_id]:-missing}" >> "$FAKE_UPLOAD_LOG"
+      ;;
+    *)
+      printf '{"ok":false,"error":"invalid action"}\n' > "$output"
+      printf '400'
+      exit 0
+      ;;
+  esac
+else
+  printf '404'
+  exit 0
+fi
+
+printf '200'

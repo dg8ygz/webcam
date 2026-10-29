@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Keep only NetworkManager DHCP lease files in RAM on read-only camera roots.
+set -Eeuo pipefail
+umask 077
+
+RAM_DIR=/run/camera-rpi-networkmanager
+STATE_DIR=/var/lib/NetworkManager
+
+setup() {
+  install -d -m 0700 "$RAM_DIR"
+  shopt -s nullglob
+  local target source
+  for target in "$STATE_DIR"/*.lease; do
+    [[ -f "$target" ]] || continue
+    source="$RAM_DIR/$(basename "$target")"
+    # Preserve the current lease for the first DHCP renewal, then keep all
+    # subsequent writes off the SD card. Never modify NetworkManager config.
+    if [[ ! -e "$source" ]]; then
+      cp -p -- "$target" "$source"
+    fi
+    if ! mountpoint -q -- "$target"; then
+      mount --bind -- "$source" "$target"
+    fi
+  done
+}
+
+teardown() {
+  shopt -s nullglob
+  local target
+  for target in "$STATE_DIR"/*.lease; do
+    mountpoint -q -- "$target" && umount -- "$target" || true
+  done
+}
+
+case "${1:-}" in
+  setup) setup ;;
+  teardown) teardown ;;
+  *) echo "Usage: $0 {setup|teardown}" >&2; exit 2 ;;
+esac

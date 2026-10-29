@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly camera clock synchronization
+
+[Timer]
+OnCalendar=*-*-01 12:05:00 Europe/Berlin
+AccuracySec=1min
+Persistent=true
+Unit=camera-rpi-camera-clock.service
+
+[Install]
+WantedBy=timers.target

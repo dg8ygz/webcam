@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+export CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_SOURCE_CONFIG="$stage/source.conf"
+export CAMERA_RPI_OPERATION_LOCK="$stage/operation.lock" CAMERA_RPI_SYSTEMCTL_BIN="$stage/systemctl"
+export SOURCE_TEST_LOG="$stage/services"
+cp "$root/config/camera-source.example.conf" "$CAMERA_RPI_SOURCE_CONFIG"
+chmod 600 "$CAMERA_RPI_SOURCE_CONFIG"
+cat > "$CAMERA_RPI_SYSTEMCTL_BIN" <<'FAKE'
+#!/bin/bash
+printf '%s\n' "$*" >> "$SOURCE_TEST_LOG"
+if [[ $1 == list-units ]]; then
+  printf 'camera-rpi-worker@test.service loaded active running\ncamera-rpi-video.service loaded active running\n'
+fi
+FAKE
+chmod 700 "$CAMERA_RPI_SYSTEMCTL_BIN"
+bash "$root/scripts/admin/camera-rpi-source" --check >/dev/null
+[[ ! -e $SOURCE_TEST_LOG ]]
+bash "$root/scripts/admin/camera-rpi-source" --apply >/dev/null
+[[ $(sed -n '2p' "$SOURCE_TEST_LOG") == 'stop camera-rpi-worker@test.service camera-rpi-video.service' ]]
+[[ $(sed -n '3p' "$SOURCE_TEST_LOG") == 'start camera-rpi-worker@test.service camera-rpi-video.service' ]]
+cp "$SOURCE_TEST_LOG" "$stage/before"
+printf 'source=v4l2\n' >> "$CAMERA_RPI_SOURCE_CONFIG"
+! bash "$root/scripts/admin/camera-rpi-source" --apply >/dev/null 2>&1
+cmp "$SOURCE_TEST_LOG" "$stage/before"
+echo 'OK: check read-only, coordinated active units, invalid source causes no service action'

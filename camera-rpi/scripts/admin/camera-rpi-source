@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Apply a validated shared source after any capture/admin operation finishes.
+set -euo pipefail
+umask 077
+[[ $EUID == 0 || ${CAMERA_RPI_ADMIN_TEST_MODE:-0} == 1 ]] || { echo 'root erforderlich' >&2; exit 1; }
+source_helper=/usr/local/libexec/camera-source.php
+if [[ -f "$(dirname "$0")/../lib/camera-source.php" ]]; then
+  source_helper="$(dirname "$0")/../lib/camera-source.php"
+fi
+[[ ${1:-} == --check || ${1:-} == --apply ]] && [[ $# == 1 ]] || { echo 'Aufruf: camera-rpi-source --check|--apply' >&2; exit 1; }
+php "$source_helper" check
+[[ $1 == --apply ]] || exit 0
+operation_lock=/run/lock/camera-rpi.operation.lock
+systemctl_bin=/usr/bin/systemctl
+if [[ ${CAMERA_RPI_ADMIN_TEST_MODE:-0} == 1 ]]; then
+  operation_lock=${CAMERA_RPI_OPERATION_LOCK:?}
+  systemctl_bin=${CAMERA_RPI_SYSTEMCTL_BIN:?}
+fi
+exec {operation_fd}>"$operation_lock"
+flock -w 120 "$operation_fd" || { echo 'Laufende Kameraaktion: Quellenwechsel nicht ausgefuehrt' >&2; exit 1; }
+php "$source_helper" check
+unit_list=$("$systemctl_bin" list-units --type=service --state=active --no-legend --plain 'camera-rpi-worker@*.service' 'camera-rpi-video.service')
+units=()
+while read -r unit rest; do [[ -z $unit ]] || units+=("$unit"); done <<< "$unit_list"
+for unit in "${units[@]}"; do
+  [[ $unit == camera-rpi-video.service || $unit =~ ^camera-rpi-worker@[a-z0-9-]+\.service$ ]] || exit 1
+done
+if (( ${#units[@]} )); then
+  # If interrupted after stopping, restore exactly the previously active units.
+  trap '"$systemctl_bin" start "${units[@]}"' EXIT
+  "$systemctl_bin" stop "${units[@]}"
+  "$systemctl_bin" start "${units[@]}"
+  trap - EXIT
+fi
+echo 'Quelle uebernommen; zuvor aktive Foto-/Videodienste neu gestartet'

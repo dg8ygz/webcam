@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# File-descriptor/inode regression, not a mocked success response. Optional
+# --ext4 mounts ONLY a fresh disposable image, never remounts the host root.
+set -euo pipefail
+PROJECT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+source "$PROJECT/ops/lib/update-inodes.sh"
+stage=$(mktemp -d /tmp/camera-update-inodes.XXXXXXXX)
+mounted=0
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  exec 7<&- 8<&- 6<&-
+  if (( mounted )); then umount "$stage/fs" || exit 1; fi
+  rm -rf -- "$stage"
+  exit "$rc"
+}
+trap cleanup EXIT
+mkdir "$stage/fs"
+if [[ ${1:-} == --ext4 ]]; then
+  [[ $EUID == 0 && $# == 1 ]]
+  truncate -s 32M "$stage/image"
+  mkfs.ext4 -q -F "$stage/image"
+  mount -o loop,nodev,nosuid,noexec "$stage/image" "$stage/fs"
+  mounted=1
+else [[ $# == 0 ]]; fi
+fs=$stage/fs
+# Model the disposable filesystem as the root device for the shared helper;
+# all other stat calls and all links/reads/renames are actual filesystem I/O.
+stat() { if [[ $# == 3 && $1 == -c && $2 == %d && $3 == / ]]; then command stat -c %d "$fs"; else command stat "$@"; fi; }
+mkdir -m 0700 "$fs/pins"
+printf 'old\n' > "$fs/program"
+exec 7<"$fs/program"
+printf 'new\n' > "$fs/next"
+mv "$fs/next" "$fs/program"
+[[ $(command stat -Lc %h /proc/$$/fd/7) == 0 ]]
+if (( mounted )); then
+  if mount -o remount,ro "$fs" 2>"$stage/expected-error"; then
+    echo 'FAIL: unlinked open inode did not block ext4 remount' >&2; exit 1
+  fi
+fi
+exec 7<&-
+exec 8<"$fs/program"
+cu_preserve_inode "$fs/program" "$fs/pins"
+printf 'replacement\n' > "$fs/next"
+mv "$fs/next" "$fs/program"
+[[ $(command stat -Lc %h /proc/$$/fd/8) == 1 ]]
+[[ $(cat <&8) == new && $(cat "$fs/program") == replacement ]]
+if (( mounted )); then mount -o remount,ro "$fs"; mount -o remount,rw "$fs"; fi
+# Rollback/remove path must retain a reader of the replacement too.
+exec 6<"$fs/program"
+cu_preserve_inode "$fs/program" "$fs/pins"
+rm "$fs/program"
+[[ $(command stat -Lc %h /proc/$$/fd/6) == 1 && $(cat <&6) == replacement ]]
+cu_preserve_inode "$fs/absent" "$fs/pins"
+ln -s absent "$fs/symlink"
+if cu_preserve_inode "$fs/symlink" "$fs/pins"; then exit 1; fi
+if cu_preserve_inode "$fs/pins" "$fs/pins"; then exit 1; fi
+if (( mounted )); then mount -o remount,ro "$fs"; fi
+echo "OK: update/rollback retain open inodes; old bytes preserved; ext4-remount=$mounted; no live services"

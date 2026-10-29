@@ -1,0 +1,23 @@
+[Unit]
+Description=Camera-RPi isolated video relay (not SSH maintenance)
+After=network.target
+
+[Service]
+DynamicUser=yes
+LoadCredential=users.json:/etc/camera-rpi-video-relay/users.json
+LoadCredential=key:/etc/camera-rpi-video-relay/key
+ExecStart=/usr/local/bin/chisel server --host 127.0.0.1 --port 9087 --reverse --keyfile %d/key --authfile %d/users.json
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

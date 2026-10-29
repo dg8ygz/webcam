@@ -1,0 +1,8 @@
+MAILTO=
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# History latency probe (appends to var/log/history_latency.log)
+# Install: copy to /etc/cron.d/cron-history-latency and reload cron.
+# Optional env: BASE_URL (default http://127.0.0.1/webcam), SLUG (default bielefeld), MAX_TIME (default 20s), LOG_FILE (default var/log/history_latency.log)
+*/10 * * * * www-data cd /var/www/html/webcam && BASE_URL="http://127.0.0.1/webcam" SLUG="bielefeld" MAX_TIME=20 LOG_FILE="/var/www/html/webcam/var/log/history_latency.log" bash /var/www/html/webcam/scripts/history_latency_probe.sh >> /var/www/html/webcam/var/log/history_latency.log 2>&1

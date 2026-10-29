@@ -1,0 +1,11 @@
+MAILTO=
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Deprecated template.
+# Do not install an archive/timeline cache rebuild cron. Archive/History/Timeline
+# performance is DB-first via /var/lib/webcam/camera-db/<slug>/db.sqlite; old
+# JSON/state caches are legacy and must not be reactivated as a performance fix.
+#
+# Former cron, intentionally disabled:
+# 0 4 * * * www-data cd /var/www/html/webcam && php bin/archive_cache_rebuild.php --year=$(date +\%Y) --verbose >> /var/www/html/webcam/var/log/archive_cache_rebuild.log 2>&1

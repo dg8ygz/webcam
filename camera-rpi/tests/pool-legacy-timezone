@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Exercise the real timestamp helpers with a London Pi and a German server.
+set -euo pipefail
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$PROJECT/scripts/lib/camera-rpi-pool.sh"
+source <(sed -n -e '/^legacy_capture_stamp_is_valid() {/,/^}/p' \
+  -e '/^legacy_capture_slot_stamp() {/,/^}/p' "$PROJECT/scripts/camera-rpi-worker")
+export TZ=Europe/London
+POOL_LEGACY_TIMEZONE=''
+[[ "$(cr_pool_legacy_stamp 1792353600 '')" == 20261018_2100 ]]
+POOL_LEGACY_TIMEZONE=Europe/Berlin
+[[ "$(cr_pool_legacy_stamp 1792353600 '')" == 20261018_2200 ]]
+[[ "$(cr_pool_legacy_stamp 1792322400 '')" == 20261018_1320 ]]
+[[ "$(cr_pool_legacy_stamp 1792384800 '')" == 20261019_0640 ]]
+# Explicit server text is already local calendar time: never convert twice.
+[[ "$(cr_pool_legacy_stamp 1792353600 20261018_2200)" == 20261018_2200 ]]
+for season in '2026-01-15 12:00:00' '2026-07-15 12:00:00'; do
+  epoch="$(TZ=Europe/Berlin date -d "$season" +%s)"
+  [[ "$(cr_pool_legacy_stamp "$epoch" '')" == "$(TZ=Europe/Berlin date -d "$season" +%Y%m%d_%H%M)" ]]
+done
+if cr_pool_legacy_stamp invalid ''; then exit 1; fi
+if cr_pool_legacy_stamp 1792353600 20260230_1200; then exit 1; fi
+stage="$(mktemp -d /dev/shm/pool-zone-test.XXXXXXXX)"
+trap 'rm -rf -- "$stage"' EXIT
+CAMERA_RPI_POOL_CONFIG="$stage/policy"
+cr_private_file() { return 0; }
+cr_trim() { printf '%s' "$1"; }
+cr_fail() { return 1; }
+for invalid in '../etc/passwd' ':Europe/Berlin' 'Europe/DoesNotExist' ''; do
+  printf 'source_server=test\nlegacy_timezone=%s\n' "$invalid" > "$CAMERA_RPI_POOL_CONFIG"
+  if cr_pool_load; then echo 'invalid zone accepted'; exit 1; fi
+done
+echo 'PASS: host-zone regression, three affected slots, explicit server stamp, winter/summer and invalid inputs'

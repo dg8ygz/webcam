@@ -1,0 +1,12 @@
+title = "Webcam and CamPi publication checks"
+
+[extend]
+useDefault = true
+
+# These are literal inputs in isolated tests, never deployment credentials.
+[[allowlists]]
+description = "Two reviewed synthetic keys in four CamPi test fixtures"
+condition = "AND"
+paths = ['''camera-rpi/tests/(admin-identifiers(?:\.cjs)?|admin-autostart|admin-logs)$''']
+regexTarget = "secret"
+regexes = ['''^(fixture-key-1234|key-journal-12345)(\\n)?$''']

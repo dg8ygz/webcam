@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Filesystem transaction fixtures only; root/mount/services are not touched.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$PROJECT/ops/update-eos-legacy.sh"
+source "$PROJECT/ops/lib/legacy-install.sh"
+STAGE="$(mktemp -d /tmp/camera-eos-update-test.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+LI_ROOT="$STAGE/root"
+ue_paths
+for path in "${UE_PATHS[@]}"; do mkdir -p "$LI_ROOT/$(dirname -- "$path")"; done
+for index in 0 2 3 5; do
+  printf 'old-file-%s\n' "$index" > "$LI_ROOT/${UE_PATHS[$index]}"
+  chmod "${UE_MODES[$index]}" "$LI_ROOT/${UE_PATHS[$index]}"
+done
+mkdir -p "$LI_ROOT/var/lib/camera-rpi/spool" "$LI_ROOT/etc/camera-rpi/keys"
+printf 'pending-photo\n' > "$LI_ROOT/var/lib/camera-rpi/spool/image.jpg"
+printf 'fake-key-unchanged\n' > "$LI_ROOT/etc/camera-rpi/keys/fixture.key"
+ue_snapshot "$STAGE/before"
+printf 'new-file\n' > "$STAGE/new"
+for index in "${!UE_PATHS[@]}"; do
+  ue_publish_file "$STAGE/new" "${UE_PATHS[$index]}" "${UE_MODES[$index]}"
+done
+ue_restore "$STAGE/before" "$STAGE/after"
+for index in 0 2 3 5; do
+  cmp "$STAGE/before/${UE_PATHS[$index]}" "$LI_ROOT/${UE_PATHS[$index]}"
+  [[ "$(stat -c %a "$LI_ROOT/${UE_PATHS[$index]}")" == "${UE_MODES[$index]#0}" ]]
+done
+for index in 1 4; do
+  [[ ! -e "$LI_ROOT/${UE_PATHS[$index]}" ]]
+  cmp "$STAGE/new" "$STAGE/after/removed/${UE_PATHS[$index]}"
+done
+grep -qx pending-photo "$LI_ROOT/var/lib/camera-rpi/spool/image.jpg"
+grep -qx fake-key-unchanged "$LI_ROOT/etc/camera-rpi/keys/fixture.key"
+ln -s "$STAGE/new" "$LI_ROOT/${UE_PATHS[1]}"
+if ue_publish_file "$STAGE/new" "${UE_PATHS[1]}" 0755 2>/dev/null; then exit 1; fi
+if ue_snapshot "$STAGE/refused" 2>/dev/null; then exit 1; fi
+printf 'enabled=false\nkey_file=/private/key\nupload_mode=legacy\n' > "$STAGE/config"
+ue_render_config "$STAGE/config" > "$STAGE/rendered"
+grep -qx enabled=false "$STAGE/rendered"
+grep -qx key_file=/private/key "$STAGE/rendered"
+grep -qx upload_mode=legacy "$STAGE/rendered"
+grep -qx gphoto_capture_mode=eos-legacy "$STAGE/rendered"
+ue_render_config "$STAGE/rendered" > "$STAGE/twice"
+cmp "$STAGE/rendered" "$STAGE/twice"
+printf 'OK: EOS-Update/Rollback: Dateien, Rechte, Quarantaene, Symlinkschutz, Key/Bild-Erhalt, Konfigurationsprofil\n'

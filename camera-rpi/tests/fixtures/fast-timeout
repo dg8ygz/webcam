@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+for argument in "$@"; do
+  case "$argument" in
+    5s|30s|15) args+=(0.1s) ;;
+    --kill-after=2) args+=(--kill-after=0.1s) ;;
+    *) args+=("$argument") ;;
+  esac
+done
+exec /usr/bin/timeout "${args[@]}"

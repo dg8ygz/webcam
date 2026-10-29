@@ -1,0 +1,13 @@
+[Unit]
+Description=Camera-RPi DEV USB stream RAM state
+Before=apache2.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=webcam-usb-stream
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/php /var/www/html/webcam/bin/usb-stream-state.php /etc/camera-rpi-video-relay/registration.json
+
+[Install]
+WantedBy=multi-user.target

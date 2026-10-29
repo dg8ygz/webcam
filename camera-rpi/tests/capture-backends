@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-rpi-video.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+fail() { printf 'FEHLER: %s\n' "$*" >&2; exit 1; }
+mkdir -p "$STAGE/etc" "$STAGE/keys" "$STAGE/run" "$STAGE/spool"
+chmod 0755 "$PROJECT_DIR/tests/fixtures/fake-v4l2-ctl" \
+  "$PROJECT_DIR/tests/fixtures/fast-timeout" "$PROJECT_DIR/tests/fixtures/fake-gphoto2" \
+  "$PROJECT_DIR/tests/fixtures/fake-curl"
+export CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_CONFIG_DIR="$STAGE/etc" CAMERA_RPI_KEY_DIR="$STAGE/keys"
+export CAMERA_RPI_RUNTIME_ROOT="$STAGE/run"
+export CAMERA_RPI_OPERATION_LOCK="$STAGE/operation.lock"
+export CAMERA_RPI_ADMIN_TEST_MODE=1
+admin_save() {
+  {
+    printf 'action=save\nserver_id=server-three\nserver_base_url=http://server-three.invalid/webcam\ncamera_slug=bielefeld\nenabled=true\n'
+    if (($#)); then printf '%s\n' "$@"; fi
+  } | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin"
+}
+admin_save key_mode=replace key=key-three-333333 > /dev/null
+source "$CAMERA_RPI_COMMON_LIB"
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$CAPTURE_BACKEND" == gphoto2 ]] || fail 'Default nicht gphoto2'
+[[ "$GPHOTO_CAPTURE_MODE" == eos-legacy ]] || fail 'Default nicht bewaehrte EOS-Sequenz'
+sed -i '/^gphoto_capture_mode=/d' "$STAGE/etc/server-three.conf"
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$GPHOTO_CAPTURE_MODE" == eos-legacy ]] || fail 'Profil ohne Modus faellt auf direkte Alternative zurueck'
+admin_save gphoto_capture_mode=eos-legacy >/dev/null
+admin_save >/dev/null
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$GPHOTO_CAPTURE_MODE" == eos-legacy ]] || fail 'EOS-Profil durch alten Client verloren'
+admin_save gphoto_capture_mode=standard >/dev/null
+admin_save >/dev/null
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$GPHOTO_CAPTURE_MODE" == standard ]] || fail 'Explizite direkte Alternative verloren'
+admin_save capture_backend=v4l2 video_device=/dev/v4l/by-id/usb-CAMERA-video-index0 \
+  video_width=1920 video_height=1080 video_warmup_frames=15 >/dev/null
+admin_save >/dev/null
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$CAPTURE_BACKEND" == v4l2 && "$VIDEO_DEVICE" == /dev/v4l/by-id/usb-CAMERA-video-index0 ]] \
+  || fail 'Alte Admin-Clients ueberschreiben Aufnahmequelle'
+list="$(printf 'action=list\n' | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin")"
+[[ "$list" == *$'\tv4l2\t/dev/v4l/by-id/usb-CAMERA-video-index0\t1920\t1080\t15'* ]] \
+  || fail 'Admin-Liste verliert Videofelder'
+before="$(sha256sum "$STAGE/etc/server-three.conf" "$STAGE/keys/server-three.key")"
+for bad in gphoto_capture_mode=exec capture_backend=exec video_device=/etc/passwd video_device=/dev/video0,evil \
+  video_device=/dev/v4l/by-id/../video0 video_width=9999 video_height=2161 \
+  video_width=0 video_width=010 video_width=99999999999999999999 \
+  video_warmup_frames=121 'video_width=$(touch /tmp/should-not-exist)' unknown=value; do
+  if admin_save "$bad" >/dev/null 2>&1; then fail "Akzeptierte ungueltigen Wert: $bad"; fi
+done
+[[ "$(sha256sum "$STAGE/etc/server-three.conf" "$STAGE/keys/server-three.key")" == "$before" ]] \
+  || fail 'Abgelehnte Eingaben veraendern Konfiguration/Key'
+admin_save capture_backend=gphoto2 >/dev/null
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$CAPTURE_BACKEND" == gphoto2 ]] || fail 'Rueckwechsel scheitert'
+admin_save capture_backend=v4l2 >/dev/null
+sed -i -e 's/^manage_root_mount=.*/manage_root_mount=0/' \
+  -e "s|^spool_root=.*|spool_root=$STAGE/spool|" "$STAGE/etc/server-three.conf"
+export CAMERA_RPI_CURL_BIN="$PROJECT_DIR/tests/fixtures/fake-curl"
+export CAMERA_RPI_V4L2_BIN="$PROJECT_DIR/tests/fixtures/fake-v4l2-ctl"
+# Der V4L2-Worker darf gphoto2 nicht voraussetzen oder heimlich aufrufen.
+export CAMERA_RPI_GPHOTO_BIN="$STAGE/missing-gphoto2"
+export CAMERA_RPI_STATUS_ROOT="$STAGE/status" CAMERA_RPI_STATUS_GROUP=''
+export FAKE_VIDEO_LOG="$STAGE/video.log" FAKE_GPHOTO_LOG="$STAGE/camera.log"
+export FAKE_CAMERA_ACTIVE="$STAGE/camera-active" FAKE_CAMERA_OVERLAP_LOG="$STAGE/overlap.log"
+export FAKE_CURL_ARGUMENT_LOG="$STAGE/curl.log" FAKE_UPLOAD_LOG="$STAGE/upload.log"
+export FAKE_CAPTURE_SERIAL="$(date +%s)"
+export CAMERA_RPI_WEATHER_HELPER="$PROJECT_DIR/scripts/lib/camera-rpi-weather.py"
+export FAKE_CURL_CONFIG_LOG="$STAGE/forms.log"
+mkdir -p "$STAGE/status"
+printf 'sensor_state=ok\nupdated_epoch=%s\ntemperature_c=23.3\nhumidity_percent=61.5\n' "$FAKE_CAPTURE_SERIAL" > "$STAGE/status/current.status"
+worker() { bash "$PROJECT_DIR/scripts/camera-rpi-worker" --once "$STAGE/etc/server-three.conf"; }
+worker > "$STAGE/worker.log" 2>&1 || { cat "$STAGE/worker.log"; fail 'V4L2-Worker'; }
+[[ -s "$STAGE/status/latest.jpg" && -s "$FAKE_UPLOAD_LOG" ]] || fail 'Bild/Upload fehlt'
+grep -q 'local_weather=.*23.3.*61.5' "$FAKE_CURL_CONFIG_LOG" || fail 'Lokale Messwerte fehlen im Upload'
+[[ ! -e "$STAGE/spool/server-three/images/$FAKE_CAPTURE_SERIAL.jpg.weather.json" ]] || fail 'Bestaetigte Wetterkopie verblieben'
+[[ ! -s "$FAKE_CAMERA_OVERLAP_LOG" ]] || fail 'Kamerasperre verletzt'
+for fault in FAKE_VIDEO_FAIL=8 FAKE_VIDEO_FORMAT=bad FAKE_VIDEO_INVALID=1; do
+  export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+  if (export "$fault"; worker) > "$STAGE/fail.log" 2>&1; then fail "Fehler als Erfolg: $fault"; fi
+  [[ -f "$STAGE/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] || fail 'Request verloren'
+  [[ ! -e "$STAGE/spool/server-three/images/$FAKE_CAPTURE_SERIAL.jpg.part" ]] || fail 'Teildatei verblieben'
+  diagnostic="$STAGE/run/server-three/capture.last-error"
+  [[ -s "$diagnostic" && "$(stat -c %a "$diagnostic")" == 600 ]] || fail 'Private Fehlerdetails fehlen'
+  [[ "$(stat -c %s "$diagnostic")" -le 65536 ]] || fail 'Fehlerdetails nicht begrenzt'
+  grep -qx "request=$FAKE_CAPTURE_SERIAL" "$diagnostic" || fail 'Fehlerdetails nicht zuordenbar'
+  diagnostic_before="$(sha256sum "$diagnostic")"
+  FAKE_COMMAND_MODE=wait worker >> "$STAGE/worker.log" 2>&1 || fail 'Retry fehlgeschlagen'
+  [[ "$diagnostic_before" == "$(sha256sum "$diagnostic")" ]] || fail 'Retry loescht Fehlerdetails'
+  [[ ! -f "$STAGE/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] || fail 'Retry nicht erledigt'
+done
+cr_load_server_config "$STAGE/etc/server-three.conf"
+result=0
+FAKE_VIDEO_HANG=1 CAMERA_RPI_TIMEOUT_BIN="$PROJECT_DIR/tests/fixtures/fast-timeout" \
+  cr_capture_to_file "$STAGE/timeout.jpg" >/dev/null 2>&1 || result=$?
+[[ "$result" == 124 ]] || fail "Capture-Timeout nicht wirksam: $result"
+# Run a real worker transaction through the EOS profile too (fake USB/server).
+# This checks library/helper resolution, spool validation and upload completion.
+admin_save capture_backend=gphoto2 gphoto_capture_mode=eos-legacy >/dev/null
+sed -i '/^gphoto_capture_mode=/d' "$STAGE/etc/server-three.conf"
+export CAMERA_RPI_GPHOTO_BIN="$PROJECT_DIR/tests/fixtures/fake-eos-gphoto"
+export CAMERA_RPI_EOS_HELPER="$PROJECT_DIR/scripts/lib/camera-rpi-eos-legacy"
+export EOS_TEST_LOG="$STAGE/eos.log"
+export FAKE_LEGACY_UPLOAD_BODY_FILE="$STAGE/legacy-upload.body"
+printf 'webcam_isoexp 0 2\n' > "$FAKE_LEGACY_UPLOAD_BODY_FILE"
+chmod 0755 "$CAMERA_RPI_GPHOTO_BIN" "$CAMERA_RPI_EOS_HELPER"
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+(cd /proc && worker) > "$STAGE/eos-worker.log" 2>&1 || { cat "$STAGE/eos-worker.log"; fail 'EOS-Worker aus nicht beschreibbarem CWD'; }
+grep -q 'sicher im Spool' "$STAGE/eos-worker.log" || fail 'EOS-Capture fehlt'
+grep -q 'von Server bestaetigt' "$STAGE/eos-worker.log" || fail 'EOS-Upload fehlt'
+grep -q 'ISO/Belichtungs-Hinweis nicht ausgefuehrt' "$STAGE/eos-worker.log" || fail 'Legacy-Hinweis nicht erkannt'
+[[ ! -e "$STAGE/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] || fail 'EOS-Auftrag verblieben'
+# Unknown bodies retain the real captured file; a later valid response releases
+# only this target's spool item, not its local preview or a different server.
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+printf 'webcam_isoexp 0 2\nstate=error failed\n' > "$FAKE_LEGACY_UPLOAD_BODY_FILE"
+if worker > "$STAGE/ack-failure.log" 2>&1; then fail 'Unbekannte Uploadantwort akzeptiert'; fi
+[[ -s "$STAGE/spool/server-three/images/$FAKE_CAPTURE_SERIAL.jpg" ]] || fail 'Unbestaetigtes Bild verloren'
+preview_before="$(sha256sum "$STAGE/status/latest.jpg")"
+printf 'webcam_isoexp 0 2\n' > "$FAKE_LEGACY_UPLOAD_BODY_FILE"
+FAKE_COMMAND_MODE=wait worker > "$STAGE/ack-retry.log" 2>&1 || fail 'Legacy-ACK-Retry fehlgeschlagen'
+[[ ! -e "$STAGE/spool/server-three/images/$FAKE_CAPTURE_SERIAL.jpg" ]] || fail 'Bestaetigtes Bild verblieben'
+[[ "$preview_before" == "$(sha256sum "$STAGE/status/latest.jpg")" ]] || fail 'Upload-Retry aendert Vorschau'
+# ISO commands set only the requested configuration under the camera lock,
+# without capture/upload. A new process must not repeat the same command.
+before="$(sha256sum "$FAKE_UPLOAD_LOG" "$STAGE/status/latest.jpg")"
+FAKE_COMMAND_MODE=legacy-isoexp worker > "$STAGE/iso-notice.log" 2>&1 || fail 'Legacy-ISO-Steuerung scheitert'
+[[ "$before" == "$(sha256sum "$FAKE_UPLOAD_LOG" "$STAGE/status/latest.jpg")" ]] || fail 'ISO loest Aufnahme oder Upload aus'
+notice="$STAGE/run/server-three/isoexp.status"
+grep -qx state=completed "$notice" || fail 'ISO-Auftrag nicht ausgefuehrt'
+[[ "$(stat -c %a "$notice")" == 600 ]] || fail 'ISO-Status nicht privat'
+grep -Fxq -- '--set-config-value exposurecompensation=2 --get-config iso --get-config exposurecompensation' "$EOS_TEST_LOG" || fail 'Falsche ISO/Belichtungs-Argumente'
+before="$(sha256sum "$EOS_TEST_LOG")"
+FAKE_COMMAND_MODE=legacy-isoexp worker >/dev/null 2>&1 || fail 'ISO-Replay-Test scheitert'
+[[ "$before" == "$(sha256sum "$EOS_TEST_LOG")" ]] || fail 'Neuer Worker wiederholt ISO-Auftrag'
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+FAKE_COMMAND_MODE=legacy-capture FAKE_EXPECT_LEGACY_STAMP=20260912_2140 worker > "$STAGE/legacy-command.log" 2>&1 || fail 'Legacy-Capture nach ISO-Hinweis gescheitert'
+grep -q "Bild $FAKE_CAPTURE_SERIAL von Server bestaetigt" "$STAGE/legacy-command.log" || fail 'Legacy-Capture-Serial verloren'
+[[ ! -e "$STAGE/spool/server-three/images/$FAKE_CAPTURE_SERIAL.jpg.legacy-stamp" ]] || fail 'Bestaetigtes Datum-Sidecar verblieben'
+# Failed upload then a completely new worker process: the original server's
+# stamp must survive on disk; neither fresh polling nor local timezone changes it.
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+if FAKE_COMMAND_MODE=legacy-capture FAKE_FAIL_UPLOAD_HOST=server-three.invalid worker > "$STAGE/stamp-failure.log" 2>&1; then fail 'Simulierter Uploadfehler nicht erkannt'; fi
+stamp_sidecar="$STAGE/spool/server-three/images/$FAKE_CAPTURE_SERIAL.jpg.legacy-stamp"
+grep -qx 20260912_2140 "$stamp_sidecar" || fail 'Aufnahmezeit nach Uploadfehler verloren'
+before="$(sha256sum "$EOS_TEST_LOG")"
+TZ=Pacific/Honolulu FAKE_COMMAND_MODE=wait FAKE_EXPECT_LEGACY_STAMP=20260912_2140 worker > "$STAGE/stamp-retry.log" 2>&1 || fail 'Neuer Worker sendet falsche Aufnahmezeit'
+[[ "$before" == "$(sha256sum "$EOS_TEST_LOG")" ]] || fail 'Upload-Retry loest neue Aufnahme aus'
+[[ ! -e "$stamp_sidecar" ]] || fail 'Bestaetigtes Retry-Sidecar verblieben'
+printf 'OK: EOS-Profil durch kompletten Worker/Spool/Upload mit simulierten Gegenstellen\n'
+printf 'OK: V4L2-Admin-Roundtrip, Grenzen, Worker/Upload/Status, Fehler-Retry und echter Timeout\n'
+
+# Shared RTSP overrides capture only; admin saves preserve the legacy USB profile.
+admin_save capture_backend=v4l2 gphoto_capture_mode=standard >/dev/null
+export CAMERA_RPI_SOURCE_CONFIG="$STAGE/source.conf"
+cp "$PROJECT_DIR/config/camera-source.example.conf" "$CAMERA_RPI_SOURCE_CONFIG"
+chmod 600 "$CAMERA_RPI_SOURCE_CONFIG"
+admin_save capture_backend=gphoto2 video_device=/dev/video99 >/dev/null
+cr_load_server_config "$STAGE/etc/server-three.conf"
+[[ "$CAPTURE_BACKEND" == v4l2 && "$VIDEO_DEVICE" == /dev/v4l/by-id/usb-CAMERA-video-index0 ]] || fail 'Shared admin save destroyed USB profile'
+list="$(printf 'action=list\n' | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin")"
+[[ "$list" == *$'\trtsp\t'* ]] || fail 'RTSP source not visible'
+export CAMERA_RPI_FFMPEG_BIN="$PROJECT_DIR/tests/fixtures/fake-rtsp-ffmpeg"
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+worker > "$STAGE/rtsp-worker.log" 2>&1 || { cat "$STAGE/rtsp-worker.log"; fail 'RTSP worker/upload'; }
+[[ ! -f "$STAGE/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] || fail 'RTSP request not ACKed'
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+FAKE_RTSP_FAIL=1 worker > "$STAGE/rtsp-worker.log" 2>&1 || true
+[[ -f "$STAGE/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] || fail 'RTSP failure lost pending request'
+FAKE_CURL_COMMAND_MODE=wait worker >> "$STAGE/rtsp-worker.log" 2>&1 || { cat "$STAGE/rtsp-worker.log"; fail 'RTSP retry'; }
+[[ ! -f "$STAGE/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] || fail 'RTSP retry not ACKed'
+echo 'OK: shared RTSP worker upload/failure/retry and admin USB preservation'

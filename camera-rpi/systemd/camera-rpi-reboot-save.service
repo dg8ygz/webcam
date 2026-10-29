@@ -1,0 +1,18 @@
+[Unit]
+Description=Save camera RAM data on orderly shutdown
+After=local-fs.target systemd-journald.service camera-rpi-reboot-restore.service
+Before=camera-rpi-sensor.service camera-rpi-climate.service
+RequiresMountsFor=/var/lib/camera-rpi/spool /var/lib/camera-rpi/reboot-backup
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/libexec/camera-rpi-reboot-save
+TimeoutStopSec=180s
+UMask=0077
+NoNewPrivileges=yes
+# No private mount namespace: restore the real root mount after the SD write.
+
+[Install]
+WantedBy=multi-user.target

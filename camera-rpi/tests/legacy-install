@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Private filesystem fixtures only. No remote host, live services or GPIO.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$PROJECT/ops/lib/legacy-install.sh"
+TEST_STAGE="$(mktemp -d /tmp/camera-rpi-legacy-test.XXXXXXXX)"
+trap 'rm -rf -- "$TEST_STAGE"' EXIT
+LI_ROOT="$TEST_STAGE/root"
+mkdir -p "$LI_ROOT" "$TEST_STAGE/backup"
+CHECKS=0
+check() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; CHECKS=$((CHECKS+1)); }
+reject() { if "$@" > "$TEST_STAGE/rejected.log" 2>&1; then printf 'FAIL: rejection expected\n' >&2; exit 1; fi; CHECKS=$((CHECKS+1)); }
+
+# The unattended first-install option leaves authentication locked, never
+# overwrites an existing entry and rejects names that could inject records.
+check li_write_locked_admin "$TEST_STAGE/locked.htpasswd" cameraadmin
+check grep -qx 'cameraadmin:!' "$TEST_STAGE/locked.htpasswd"
+check test "$(stat -c '%a' "$TEST_STAGE/locked.htpasswd")" = 600
+reject li_write_locked_admin "$TEST_STAGE/locked.htpasswd" replacement
+reject li_write_locked_admin "$TEST_STAGE/invalid.htpasswd" $'name\nother'
+check test ! -e "$TEST_STAGE/invalid.htpasswd"
+check php -r 'exit(password_verify("", "!") || password_verify("cameraadmin", "!") ? 1 : 0);'
+
+# Mock systemd reads, including template handling and query errors. Any service
+# mutation would fail the mock. No host systemctl invocation in these tests.
+systemctl() {
+  case "$1" in
+    list-unit-files)
+      [[ ${QUERY_FAIL:-0} == 0 ]] || return 1
+      # Real systemctl exits 1 when a glob matches nothing. A fresh legacy host
+      # must instead query the full catalog and ignore unrelated enabled units.
+      if [[ ${FRESH_STACK:-0} == 1 ]]; then
+        [[ "$*" != *'camera-rpi-*'* ]] || return 1
+        printf 'cron.service enabled\napache2.service enabled\n'
+      else
+        printf 'camera-rpi-worker@.service disabled\ncamera-rpi-sensor.service %s\n' "${UNIT_ENABLED:-disabled}"
+      fi ;;
+    show)
+      [[ $2 != *@.* ]] || return 99
+      printf '%s\n' "${UNIT_STATE:-inactive}" ;;
+    list-units)
+      [[ ${QUERY_FAIL:-0} == 0 ]] || return 1
+      [[ ${INSTANCE_ACTIVE:-0} == 0 ]] || printf 'camera-rpi-worker@test.service active\n' ;;
+    *) return 98 ;;
+  esac
+}
+check li_require_quiet_new_stack
+FRESH_STACK=1 check li_require_quiet_new_stack
+FRESH_STACK=1 INSTANCE_ACTIVE=1 reject li_require_quiet_new_stack
+FRESH_STACK=1 QUERY_FAIL=1 reject li_require_quiet_new_stack
+UNIT_ENABLED=enabled reject li_require_quiet_new_stack
+UNIT_STATE=active reject li_require_quiet_new_stack
+INSTANCE_ACTIVE=1 reject li_require_quiet_new_stack
+QUERY_FAIL=1 reject li_require_quiet_new_stack
+mkdir -p "$LI_ROOT/etc/apache2/conf-enabled"
+ln -s /missing-camera-config "$LI_ROOT/etc/apache2/conf-enabled/camera-rpi-admin.conf"
+reject li_require_quiet_new_stack
+unlink "$LI_ROOT/etc/apache2/conf-enabled/camera-rpi-admin.conf"
+unset -f systemctl
+
+# Manifest parsing: traversal, unexpected namespaces, duplicates and bad modes.
+check li_load_manifest "$PROJECT/ops/legacy-install-files.tsv"
+check li_require_fresh
+for bad in '../escape' '/etc/passwd' 'a/../b' 'a//b' './a'; do reject li_path_valid "$bad"; done
+printf 'source|etc/passwd|0644\n' > "$TEST_STAGE/bad"
+reject li_load_manifest "$TEST_STAGE/bad"
+printf 'source|etc/camera-rpi/valid|0777\n' > "$TEST_STAGE/bad"
+reject li_load_manifest "$TEST_STAGE/bad"
+printf 'source|etc/camera-rpi/valid|0644\nsource|etc/camera-rpi/valid|0644\n' > "$TEST_STAGE/bad"
+reject li_load_manifest "$TEST_STAGE/bad"
+li_load_manifest "$PROJECT/ops/legacy-install-files.tsv"
+
+# Existing files and symlinked parents are never overwritten or traversed.
+mkdir -p "$LI_ROOT/etc/camera-rpi"
+printf 'existing private key\n' > "$LI_ROOT/etc/camera-rpi/keep.key"
+reject li_require_fresh
+mv "$LI_ROOT/etc/camera-rpi" "$TEST_STAGE/previous"
+ln -s "$TEST_STAGE/previous" "$LI_ROOT/etc/camera-rpi"
+reject li_require_fresh
+unlink "$LI_ROOT/etc/camera-rpi"
+check test -s "$TEST_STAGE/previous/keep.key"
+
+# Payload includes every declared file and executable mode. No native --run.
+check li_prepare_payload "$PROJECT" "$TEST_STAGE/payload"
+for i in "${!LI_DESTINATIONS[@]}"; do
+  check cmp -s "$PROJECT/${LI_SOURCES[$i]}" "$TEST_STAGE/payload/${LI_DESTINATIONS[$i]}"
+done
+check test -x "$TEST_STAGE/payload/usr/local/libexec/camera-rpi-worker"
+check grep -qx 'enabled=false' "$TEST_STAGE/payload/etc/camera-rpi/device.conf"
+check php -r '$c=json_decode(file_get_contents($argv[1]),true,16,JSON_THROW_ON_ERROR); exit($c["mode"]==="off"?0:1);' "$TEST_STAGE/payload/etc/camera-rpi/climate.json"
+CAMERA_RPI_CLIMATE_CONFIG="$TEST_STAGE/payload/etc/camera-rpi/climate.json" \
+  php "$TEST_STAGE/payload/usr/local/libexec/camera-rpi-climate.php" check
+
+# A legacy file, key, picture and shared-parent permissions must stay unchanged.
+mkdir -p "$LI_ROOT/usr/local/libexec" "$LI_ROOT/tmp"
+chmod 0711 "$LI_ROOT/usr/local/libexec"
+printf 'old config including private key\n' > "$LI_ROOT/etc/webcam.cfg"
+printf 'old image\n' > "$LI_ROOT/tmp/raw.jpg"
+check li_publish "$TEST_STAGE/payload"
+check test "$(stat -c '%a' "$LI_ROOT/usr/local/libexec")" = 711
+reject li_publish "$TEST_STAGE/payload"
+
+# Simulate data created AFTER installation. Rollback must keep these, not just
+# restore the empty initial spool. Both persistent and RAM data are exercised.
+mkdir -p "$LI_ROOT/etc/camera-rpi/keys" "$LI_ROOT/var/lib/camera-rpi/spool/test/images" \
+  "$LI_ROOT/var/lib/camera-rpi/sensor-backup" "$LI_ROOT/run/camera-rpi-status"
+printf 'later private key\n' > "$LI_ROOT/etc/camera-rpi/keys/test.key"
+printf 'unconfirmed JPEG bytes\n' > "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789210000.jpg"
+printf 'historical climate data\n' > "$LI_ROOT/var/lib/camera-rpi/sensor-backup/climate.tsv"
+printf 'latest RAM history\n' > "$LI_ROOT/run/camera-rpi-status/history.tsv"
+cp -a "$LI_ROOT/etc/webcam.cfg" "$TEST_STAGE/old.cfg"
+cp -a "$LI_ROOT/tmp/raw.jpg" "$TEST_STAGE/old.jpg"
+
+# A failed snapshot (e.g. disk full) must never start moving live files.
+(tar() { return 28; }; reject li_quarantine "$TEST_STAGE/backup")
+check test -f "$LI_ROOT/usr/local/libexec/camera-rpi-worker"
+check test -f "$LI_ROOT/etc/camera-rpi/keys/test.key"
+# An archive that cannot be verified is equally unusable, even if creation
+# succeeded. A rollback through a substituted application directory is refused.
+(tar() { [[ ${3:-} != --compare ]] || return 1; command tar "$@"; }; reject li_quarantine "$TEST_STAGE/backup")
+check test -f "$LI_ROOT/etc/camera-rpi/keys/test.key"
+mv "$LI_ROOT/etc/camera-rpi" "$TEST_STAGE/symlink-rollback"
+ln -s "$TEST_STAGE/symlink-rollback" "$LI_ROOT/etc/camera-rpi"
+reject li_quarantine "$TEST_STAGE/backup"
+unlink "$LI_ROOT/etc/camera-rpi"
+mv "$TEST_STAGE/symlink-rollback" "$LI_ROOT/etc/camera-rpi"
+check li_quarantine "$TEST_STAGE/backup"
+check test ! -e "$LI_ROOT/usr/local/libexec/camera-rpi-worker"
+check test ! -e "$LI_ROOT/etc/camera-rpi"
+check test -s "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789210000.jpg"
+check test -s "$LI_ROOT/run/camera-rpi-status/history.tsv"
+check cmp -s "$LI_ROOT/etc/webcam.cfg" "$TEST_STAGE/old.cfg"
+check cmp -s "$LI_ROOT/tmp/raw.jpg" "$TEST_STAGE/old.jpg"
+archives=("$TEST_STAGE/backup"/rollback.*/current.tar)
+snapshot="${archives[${#archives[@]}-1]}"
+# Select the nonempty snapshot independently of random directory sort order.
+for archive in "${archives[@]}"; do [[ -s "$archive" ]] && snapshot="$archive"; done
+mkdir "$TEST_STAGE/restored"
+tar -xf "$snapshot" -C "$TEST_STAGE/restored"
+check grep -qx 'later private key' "$TEST_STAGE/restored/etc/camera-rpi/keys/test.key"
+check cmp -s "$TEST_STAGE/restored/var/lib/camera-rpi/spool/test/images/1789210000.jpg" "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789210000.jpg"
+check test -s "$TEST_STAGE/restored/var/lib/camera-rpi/sensor-backup/climate.tsv"
+check test -s "$TEST_STAGE/restored/run/camera-rpi-status/history.tsv"
+check test "$(stat -c '%a' "$(dirname "$snapshot")")" = 700
+# A repeated rollback preserves previous recovery folders and remaining data.
+check li_quarantine "$TEST_STAGE/backup"
+check test -s "$snapshot"
+check test -s "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789210000.jpg"
+
+# Source/entry-point syntax and documented default: help must be side-effect free.
+check bash -n "$PROJECT/ops/install-legacy-camera.sh"
+check bash "$PROJECT/ops/install-legacy-camera.sh" --help
+printf 'OK: %s legacy installation/rollback checks; isolated files only\n' "$CHECKS"

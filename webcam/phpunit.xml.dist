@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit bootstrap="tests/bootstrap.php"
+         colors="true"
+         stopOnFailure="false">
+  <testsuites>
+    <testsuite name="Webcam">
+      <directory suffix="Test.php">tests</directory>
+    </testsuite>
+  </testsuites>
+  <php>
+    <env name="WEBCAM_BASE_URL" value=""/>
+    <env name="WEBCAM_ADMIN_API_TOKEN" value="test-token"/>
+    <env name="WEBCAM_CONFIG_DB" value="database/webcams.sqlite"/>
+  </php>
+</phpunit>

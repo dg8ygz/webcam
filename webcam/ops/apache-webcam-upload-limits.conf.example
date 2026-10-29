@@ -1,0 +1,40 @@
+# Fruehe Upload-Grenzen fuer den oeffentlichen Apache-Reverse-Proxy.
+#
+# WICHTIG: Diese Datei muss innerhalb des VirtualHost-Kontexts geladen werden,
+# in dem auch db0bi-proxy.conf mit den ProxyPass-Regeln liegt. Als globale
+# conf-enabled-Datei greift der Schutz in der aktuellen Proxy-Anordnung nicht
+# verlaesslich. Das Runbook ops/upload-request-hardening.md zeigt Einbau,
+# Abnahme und Rueckweg.
+#
+# Die Regeln sehen nur Request-Zeile und Header. Uebergrosse Requests werden
+# dadurch beendet, bevor mod_proxy den Body an den Origin weiterreichen kann.
+# Bekannte Upload-Clients senden Dateien mit einer numerischen Content-Length.
+# Transfer-Encoding/chunked beziehungsweise eine fehlende Laenge wird fuer
+# genau diese beiden Endpunkte mit HTTP 411 abgelehnt, damit die Grenze nicht
+# durch einen Body unbekannter Laenge umgangen werden kann.
+
+RewriteEngine On
+
+# Beide Upload-Protokolle akzeptieren ausschliesslich POST-Bodys mit einer
+# eindeutigen dezimalen Laenge. Die vier bekannten Wege sind /webcam,
+# /webcam2, /testx und der historische direkte /include-Pfad.
+RewriteCond expr "%{REQUEST_METHOD} == 'POST' && %{REQUEST_URI} =~ m#^/(?:(?:webcam|webcam2|testx)/)?include/upload(?:-chunk)?\.php$# && req_novary('Content-Length') !~ m#^[0-9]+$#"
+RewriteRule "^" "-" [R=411,L]
+
+# Chunk-v1 uebertraegt hoechstens 1 MiB Nutzlast. Das zweite MiB deckt
+# Multipart-Grenzen, Hashes und kleine Protokollfelder ab.
+RewriteCond expr "%{REQUEST_METHOD} == 'POST' && %{REQUEST_URI} =~ m#^/(?:(?:webcam|webcam2|testx)/)?include/upload-chunk\.php$# && req_novary('Content-Length') -gt 2097152"
+RewriteRule "^" "-" [R=413,L]
+
+# Der Legacy-Endpunkt akzeptiert standardmaessig hoechstens 25 MiB Bilddaten.
+# Ein weiteres MiB bleibt fuer Multipart-Grenzen und Metadaten reserviert.
+RewriteCond expr "%{REQUEST_METHOD} == 'POST' && %{REQUEST_URI} =~ m#^/(?:(?:webcam|webcam2|testx)/)?include/upload\.php$# && req_novary('Content-Length') -gt 27262976"
+RewriteRule "^" "-" [R=413,L]
+
+# Absichtlich nicht enthalten:
+#
+# - mod_qos: Das Modul unterstuetzt laut eigener Laufzeitwarnung das hier
+#   verwendete MPM prefork nicht zuverlaessig.
+# - RequestReadTimeout: Diese Direktive wirkt vHost-weit und wuerde auch die
+#   vielen nicht zur Webcam gehoerenden Proxy-, Stream- und WebSocket-Dienste
+#   des gemeinsamen oeffentlichen vHosts veraendern.

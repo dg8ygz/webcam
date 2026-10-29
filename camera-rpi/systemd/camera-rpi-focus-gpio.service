@@ -1,0 +1,24 @@
+[Unit]
+Description=Optional camera focus gate (LOW for capture, bounded HIGH for focus)
+Requires=camera-rpi-gpio.service
+After=camera-rpi-gpio.service
+ConditionPathExists=/etc/camera-rpi/gpio.json
+
+[Service]
+Type=simple
+RuntimeDirectory=camera-rpi-focus
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/php /usr/local/libexec/camera-rpi-gpio.php focus
+ExecStartPost=/usr/bin/php /usr/local/libexec/camera-rpi-gpio.php ready-focus
+TimeoutStartSec=15s
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

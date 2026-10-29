@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Exercise only the mount decision; no real mounts or camera/network calls.
+set -euo pipefail
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source <(sed -n '/^make_root_writable()/,/^restore_root_readonly()/p' \
+  "$PROJECT_DIR/scripts/camera-rpi-worker" | sed '$d')
+MANAGE_ROOT_MOUNT=1
+ROOT_RW_OWNED=0
+SPOOL_ROOT=/test-spool
+RUNTIME_ROOT=/test-runtime
+FINDMNT_BIN=fake_findmnt
+MOUNT_BIN=fake_mount
+mounts=0
+fake_findmnt() {
+  case "$*" in
+    *"/test-spool") printf '%s\n' "$SPOOL_FS" ;;
+    *"/test-runtime") printf '%s\n' "$RUNTIME_FS" ;;
+    *) return 1 ;;
+  esac
+}
+fake_mount() { ((mounts += 1)); }
+root_is_readonly() { return 0; }
+cr_log() { :; }
+cr_fail() { echo "$*" >&2; return 1; }
+SPOOL_FS=tmpfs RUNTIME_FS=tmpfs make_root_writable
+[[ "$mounts" == 0 && "$ROOT_RW_OWNED" == 0 ]]
+SPOOL_FS=ext4 RUNTIME_FS=tmpfs make_root_writable
+[[ "$mounts" == 1 && "$ROOT_RW_OWNED" == 1 ]]
+ROOT_RW_OWNED=0
+SPOOL_FS=tmpfs RUNTIME_FS=ext4 make_root_writable
+[[ "$mounts" == 2 && "$ROOT_RW_OWNED" == 1 ]]
+echo 'OK: RAM-only spool/runtime avoid root remount; persistent paths keep RO handling.'

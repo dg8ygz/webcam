@@ -1,0 +1,11 @@
+[Unit]
+Description=Volatile temporary files
+
+[Mount]
+What=tmpfs
+Where=/var/tmp
+Type=tmpfs
+Options=mode=1777,nosuid,nodev,noatime,size=64M
+
+[Install]
+WantedBy=local-fs.target

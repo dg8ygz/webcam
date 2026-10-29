@@ -1,0 +1,36 @@
+[Unit]
+Description=Camera-RPi bounded HTTPS maintenance for %i
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/camera-rpi/maintenance/%i.json
+
+[Service]
+Type=simple
+DynamicUser=yes
+LoadCredential=tunnel.json:/etc/camera-rpi/maintenance/%i.json
+ExecStart=/usr/bin/python3 /usr/local/libexec/camera-rpi-tunnel.py run %i
+RuntimeDirectory=camera-rpi-tunnel-%i
+RuntimeDirectoryMode=0755
+UMask=0077
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=5
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=96M
+TasksMax=64
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target

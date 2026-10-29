@@ -1,0 +1,27 @@
+# Source|absolute target|mode. Dependency libraries precede their consumers.
+scripts/lib/gpio-config.php|/usr/local/libexec/gpio-config.php|0644
+scripts/lib/climate-gpio.php|/usr/local/libexec/climate-gpio.php|0644
+scripts/camera-rpi-climate.php|/usr/local/libexec/camera-rpi-climate.php|0644
+scripts/camera-rpi-gpio.php|/usr/local/libexec/camera-rpi-gpio.php|0644
+scripts/camera-rpi-power.php|/usr/local/libexec/camera-rpi-power.php|0644
+scripts/camera-rpi-sensor|/usr/local/libexec/camera-rpi-sensor|0755
+scripts/admin/camera-rpi-admin|/usr/local/sbin/camera-rpi-admin|0750
+admin/src/gpio.php|/usr/local/share/camera-rpi-admin/src/gpio.php|0644
+admin/src/gpio-panel.php|/usr/local/share/camera-rpi-admin/src/gpio-panel.php|0644
+admin/src/climate-panel.php|/usr/local/share/camera-rpi-admin/src/climate-panel.php|0644
+admin/public/gpio.js|/usr/local/share/camera-rpi-admin/public/gpio.js|0644
+admin/src/power.php|/usr/local/share/camera-rpi-admin/src/power.php|0644
+admin/src/power-panel.php|/usr/local/share/camera-rpi-admin/src/power-panel.php|0644
+admin/public/power.js|/usr/local/share/camera-rpi-admin/public/power.js|0644
+admin/public/power-status.php|/usr/local/share/camera-rpi-admin/public/power-status.php|0644
+admin/public/style.css|/usr/local/share/camera-rpi-admin/public/style.css|0644
+admin/public/index.php|/usr/local/share/camera-rpi-admin/public/index.php|0644
+systemd/camera-rpi-gpio.service|/etc/systemd/system/camera-rpi-gpio.service|0644
+systemd/camera-rpi-camera-power.service|/etc/systemd/system/camera-rpi-camera-power.service|0644
+systemd/gpio-consumer.conf|/etc/systemd/system/camera-rpi-sensor.service.d/gpio.conf|0644
+systemd/gpio-consumer.conf|/etc/systemd/system/camera-rpi-climate.service.d/gpio.conf|0644
+systemd/gpio-worker.conf|/etc/systemd/system/camera-rpi-worker@.service.d/gpio.conf|0644
+GPIO.md|/usr/local/share/doc/camera-rpi/GPIO.md|0644
+scripts/lib/camera-rpi-focus-gpio.php|/usr/local/libexec/camera-rpi-focus-gpio.php|0644
+scripts/lib/camera-rpi-common.sh|/usr/local/libexec/camera-rpi-common.sh|0755
+systemd/camera-rpi-focus-gpio.service|/etc/systemd/system/camera-rpi-focus-gpio.service|0644

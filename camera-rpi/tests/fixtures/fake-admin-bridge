@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+# Sehr kleine Antwortmaschine fuer den HTTP-Test der PHP-Oberflaeche.
+set -uo pipefail
+action=""
+declare -A fields=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  fields["${line%%=*}"]="${line#*=}"
+  [[ "${line%%=*}" == "action" ]] && action="${line#*=}"
+done
+
+case "$action" in
+  source_devices) printf '[]\n' ;;
+  climate_get)
+    project="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+    CAMERA_RPI_CLIMATE_CONFIG=/nonexistent-camera-rpi-test-climate.json \
+      php "$project/scripts/camera-rpi-climate.php" get ;;
+  climate_save|climate_reset) printf 'OK\tKlima-Testaktion angenommen\n' ;;
+  list)
+    printf 'server_id\tserver_base_url\tcamera_slug\tenabled\tupload_mode\tstate\tupdated_epoch\tmessage\trequests\timages\tactive\tcapture_backend\tvideo_device\tvideo_width\tvideo_height\tvideo_warmup_frames\tcapture_source_server\n'
+    printf 'web-test\thttps://server.invalid/webcam\tbielefeld\t1\tchunked\twaiting\t0\t<script>nicht ausfuehren</script>\t0\t0\tactive\t%s\t/dev/video0\t1920\t1080\t15\t%s\n' "${FAKE_ADMIN_BACKEND:-v4l2}" "${FAKE_ADMIN_POOL_SOURCE:--}"
+    if [[ ${FAKE_ADMIN_MULTI:-0} == 1 ]]; then
+      printf 'other-target\thttps://other.invalid/webcam\tbielefeld\t1\tchunked\twaiting\t0\tReady\t0\t0\tactive\tgphoto2\t/dev/video0\t1920\t1080\t15\t%s\n' "${FAKE_ADMIN_POOL_SOURCE:--}"
+    fi
+    ;;
+  save)
+    if [[ "${fields[server_id]:-}" == web-test ]]; then
+      [[ "${fields[key_mode]:-}" == keep && -z "${fields[key]:-}" ]] || exit 1
+    fi
+    [[ "${fields[capture_backend]:-}" == v4l2 && "${fields[video_device]:-}" == /dev/video0 \
+      && "${fields[video_width]:-}" == 1920 && "${fields[video_height]:-}" == 1080 \
+      && "${fields[video_warmup_frames]:-}" == 15 ]] || exit 1
+    printf 'OK\tTestaktion angenommen\n' ;;
+  validate|set_enabled|restart) printf 'OK\tTestaktion angenommen\n' ;;
+  logs)
+    [[ "${fields[server_id]:-}" == web-test ]] || exit 1
+    printf 'Worker: <script>journal-must-not-execute</script>\n' ;;
+  capture)
+    [[ "${fields[server_id]:-}" == web-test ]] || exit 1
+    printf 'OK\tNur gewaehlte Kamera\n' ;;
+  focus)
+    [[ "${fields[server_id]:-}" == web-test && "${FAKE_ADMIN_BACKEND:-v4l2}" == gphoto2 ]] || exit 1
+    case "${fields[focus_mode]:-}" in --|-|auto|+|++) ;; *) exit 1 ;; esac
+    printf '%s:%s\n' "${fields[server_id]}" "${fields[focus_mode]}" >> "$FAKE_ADMIN_FOCUS_LOG"
+    printf 'OK\tFokus vorgemerkt\n' ;;
+  *) printf 'ERROR\tUnbekannte Testaktion\n' >&2; exit 1 ;;
+esac

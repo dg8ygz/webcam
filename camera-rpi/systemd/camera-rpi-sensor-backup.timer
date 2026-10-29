@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up RAM sensor history once daily
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 Europe/Berlin
+AccuracySec=1min
+# No persistent timer stamp on SD; no extra backup on every boot.
+Persistent=false
+Unit=camera-rpi-sensor-backup.service
+
+[Install]
+WantedBy=timers.target

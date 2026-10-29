@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Real worker functions, synthetic camera output and HTTP transport only.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-diagnostics.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source <(sed -n -e '/^save_capture_failure() {/,/^}/p' -e '/^report_capture_failure() {/,/^}/p' "$PROJECT/scripts/camera-rpi-worker")
+source "$PROJECT/scripts/lib/camera-rpi-common.sh"
+RUNTIME_ROOT="$STAGE/run" SERVER_RUNTIME_DIR="$STAGE/run/a" POOL_ENABLED=1
+mkdir -p "$SERVER_RUNTIME_DIR"
+KEY_FILE="$STAGE/key"; printf 'fixture-private-key\n' > "$KEY_FILE"
+SERVER_BASE_URL=http://fixture.invalid/webcam CAMERA_SLUG=fixture
+SHA256SUM_BIN=/usr/bin/sha256sum CURL_BIN=fake_curl
+curl_common_arguments() { CURL_ARGUMENTS=(); }
+cr_log() { printf '%s\n' "$*" >> "$STAGE/events"; }
+TEST_HTTP=200 TEST_BODY=ok TEST_EXIT=0
+fake_curl() {
+  printf '%s\n' "$@" > "$STAGE/args"
+  echo call >> "$STAGE/calls"
+  cp "$SERVER_RUNTIME_DIR/diagnostic.payload" "$STAGE/sent"
+  grep -q 'X-Upload-Key: fixture-private-key' "$SERVER_RUNTIME_DIR/diagnostic.header"
+  grep -q 'key=fixture-private-key' "$SERVER_RUNTIME_DIR/diagnostic.form"
+  printf '%s\n' "$TEST_BODY" > "$SERVER_RUNTIME_DIR/diagnostic.response"
+  printf '%s' "$TEST_HTTP"
+  return "$TEST_EXIT"
+}
+printf 'Failed eosremoterelease\nfixture-private-key\nrtsp://user:pass@example.invalid/live?key=secret\npassword=hidden\n' > "$STAGE/error"
+save_capture_failure "$STAGE/error" 1791655200 1
+cmp "$SERVER_RUNTIME_DIR/capture.last-error" "$RUNTIME_ROOT/capture.last-error"
+report_capture_failure
+test -s "$SERVER_RUNTIME_DIR/diagnostic.ack"
+grep -q 'Failed eosremoterelease' "$STAGE/sent"
+if grep -Eq 'fixture-private-key|user:pass|password=hidden' "$STAGE/sent" "$STAGE/args"; then exit 1; fi
+test -f "$SERVER_RUNTIME_DIR/capture.last-error"
+test ! -e "$SERVER_RUNTIME_DIR/diagnostic.header"
+test ! -e "$SERVER_RUNTIME_DIR/diagnostic.form"
+test "$(stat -c %a "$RUNTIME_ROOT/capture.last-error")" = 600
+echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+report_capture_failure
+test "$(wc -l < "$STAGE/calls")" = 1
+# Another target sends the shared failure independently, with its own ACK.
+SERVER_RUNTIME_DIR="$RUNTIME_ROOT/b"; mkdir "$SERVER_RUNTIME_DIR"
+report_capture_failure
+test "$(wc -l < "$STAGE/calls")" = 2
+test -s "$SERVER_RUNTIME_DIR/diagnostic.ack"
+# No success for HTTP errors, transport errors, empty/HTML/negative replies.
+rm "$SERVER_RUNTIME_DIR/diagnostic.ack"
+for failure in http transport empty html; do
+  TEST_HTTP=200 TEST_BODY=ok TEST_EXIT=0
+  case "$failure" in
+    http) TEST_HTTP=500;; transport) TEST_EXIT=28;; empty) TEST_BODY='';; html) TEST_BODY='<html>ok</html>';;
+  esac
+  echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+  report_capture_failure
+  test ! -e "$SERVER_RUNTIME_DIR/diagnostic.ack"
+  before="$(wc -l < "$STAGE/calls")"
+  report_capture_failure
+  test "$(wc -l < "$STAGE/calls")" = "$before"
+done
+TEST_HTTP=200 TEST_BODY=ok TEST_EXIT=0
+echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+report_capture_failure
+test -s "$SERVER_RUNTIME_DIR/diagnostic.ack"
+# Foto-Webcam confirms logs with the exact request serial, not a bare "ok".
+# Never accept a different serial, a substring, or text surrounding the ACK.
+rm "$SERVER_RUNTIME_DIR/diagnostic.ack"
+for TEST_BODY in 'log ok (1791655201).' 'log ok (179165520).' \
+    'log ok (01791655200).' 'warning: log ok (1791655200).' \
+    'log ok (1791655200). error' 'log ok (1791655200)' \
+    $'log ok (1791655200).\n'; do
+  echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+  report_capture_failure
+  test ! -e "$SERVER_RUNTIME_DIR/diagnostic.ack"
+done
+TEST_BODY='log ok (1791655200).'
+for failure in http transport; do
+  TEST_HTTP=200 TEST_EXIT=0
+  case "$failure" in http) TEST_HTTP=500;; transport) TEST_EXIT=28;; esac
+  echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+  report_capture_failure
+  test ! -e "$SERVER_RUNTIME_DIR/diagnostic.ack"
+done
+TEST_HTTP=200 TEST_EXIT=0
+echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+report_capture_failure
+test -s "$SERVER_RUNTIME_DIR/diagnostic.ack"
+before="$(wc -l < "$STAGE/calls")"
+echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+report_capture_failure
+test "$(wc -l < "$STAGE/calls")" = "$before"
+TEST_BODY=ok
+# Isolated non-pool worker and bounded capture output.
+POOL_ENABLED=0
+head -c 100000 /dev/zero | tr '\0' x > "$STAGE/error"
+save_capture_failure "$STAGE/error" 1791655800 1
+test "$(wc -c < "$SERVER_RUNTIME_DIR/capture.last-error")" -le 65536
+echo 0 > "$SERVER_RUNTIME_DIR/diagnostic.attempt"
+report_capture_failure
+test "$(wc -c < "$STAGE/sent")" -le 65536
+echo 'OK: pooled/per-target diagnostics, redaction, bounded size, private credentials, ACK, retry and throttle'

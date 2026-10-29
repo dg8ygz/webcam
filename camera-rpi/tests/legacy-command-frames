@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Reproduce the operator's command.php output, including its extra final LF.
+# Real parser functions only; no worker main, camera, network, key or services.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-command-frames.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source "$PROJECT/scripts/lib/camera-rpi-common.sh"
+source <(sed -n -e '/^parse_command() {/,/^}/p' \
+  -e '/^legacy_capture_stamp_is_valid() {/,/^}/p' \
+  -e '/^legacy_capture_slot_stamp() {/,/^}/p' \
+  -e '/^legacy_isoexp_line_is_valid() {/,/^}/p' "$PROJECT/scripts/camera-rpi-worker")
+COMMAND_RESPONSE_FILE="$STAGE/command.response"
+SERVER_ID=fixture
+CAPTURE_BACKEND=gphoto2
+# This case deliberately exercises the alternative backend without ISOEXP.
+GPHOTO_CAPTURE_MODE=standard
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+parse() { printf '%s' "$1" > "$COMMAND_RESPONSE_FILE"; parse_command; }
+# command.txt contains "serial\ncommand\n"; echo adds one more newline.
+expect parse $'command\n1789241934\nwebcam_isoexp 0 2\n\n'
+expect test "$POLLED_COMMAND" = unsupported-isoexp
+expect test "$POLLED_SERIAL" = 1789241934
+expect test "$POLLED_LEGACY_NOTICE" = 'webcam_isoexp 0 2'
+for response in $'command\n1789241934\nwebcam_capture\n\n' \
+  $'command\r\n1789241934\r\nwebcam_capture\r\n\r\n'; do
+  expect parse "$response"
+  expect test "$POLLED_COMMAND" = capture
+  expect test "$POLLED_SERIAL" = 1789241934
+done
+expect parse $'command\n1789241934\nwebcam_capture 20260912_2140\n'
+expect test "$POLLED_COMMAND" = capture
+expect test "$POLLED_SERIAL" = 1789241934
+expect parse $'wait\n0\nwait\n\n'
+expect test "$POLLED_COMMAND" = wait
+expect parse $'focus\n1789241934\n++\n'
+expect test "$POLLED_COMMAND" = focus
+for response in $'command\n1789241934\nwebcam_isoexp 0 2\nreboot\n' \
+  $'command\n1789241934\nwebcam_isoexp 0 2; reboot\n' \
+  $'command\n1789241934\nwebcam_reboot\n\n' \
+  $'command\ninvalid\nwebcam_isoexp 0 2\n\n' \
+  $'command\n1789241934\nwebcam_isoexp 0 99\n\n' \
+  $'command\n\n1789241934\nwebcam_isoexp 0 2\n' \
+  $'command\n1789241934\nwebcam_capture\nreboot\n' \
+  $'command\n1789241934\nwebcam_capture 20260912_2140; reboot\n' \
+  $'focus\n1789241934\n++\n\n'; do
+  if parse "$response" >/dev/null 2>&1; then printf 'FAIL: ungueltiger Frame akzeptiert\n' >&2; exit 1; fi
+  ((checks+=1))
+done
+printf 'command\n1789241934\nwebcam_isoexp 0 2\000\n' > "$COMMAND_RESPONSE_FILE"
+if parse_command >/dev/null 2>&1; then exit 1; fi
+((checks+=1))
+printf 'OK: %s Legacy-Command-Pruefungen; abschliessende Leerzeilen/CRLF/Capture/ISO-Hinweis/Fokusgrenzen\n' "$checks"

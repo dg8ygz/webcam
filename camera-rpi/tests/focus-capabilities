@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Actual focus helper, fake camera only. No network, GPIO, IIO or real gphoto.
+set -euo pipefail
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-rpi-focus-capabilities.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source "$PROJECT_DIR/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_GPHOTO_BIN="$PROJECT_DIR/tests/fixtures/fake-focus"
+export CAMERA_RPI_OPERATION_LOCK="$STAGE/operation.lock"
+export FAKE_FOCUS_LOG="$STAGE/moves" FAKE_FOCUS_TRACE="$STAGE/trace"
+chmod +x "$CAMERA_RPI_GPHOTO_BIN"
+exec 9>"$CAMERA_RPI_OPERATION_LOCK"
+flock -n 9
+checks=0
+check() { checks=$((checks+1)); "$@" || { echo "FAIL: $*" >&2; exit 1; }; }
+empty_logs() { : > "$FAKE_FOCUS_LOG"; : > "$FAKE_FOCUS_TRACE"; }
+
+# Merely sourcing/validating the mode must not query or mutate the camera.
+check test ! -e "$FAKE_FOCUS_TRACE"
+cr_focus_mode_valid +
+check test ! -e "$FAKE_FOCUS_TRACE"
+for interface in output viewfinder eosviewfinder; do
+  export FAKE_FOCUS_INTERFACE="$interface"
+  for mode in -- - auto + ++; do
+    empty_logs
+    cr_focus_to_camera "$mode"
+    check test "$(wc -l < "$FAKE_FOCUS_LOG")" -eq 1
+    if [[ "$interface" == output ]]; then
+      check grep -q -- '--set-config-value output=PC --capture-preview --stdout' "$FAKE_FOCUS_LOG"
+      check test "$(tail -n 1 "$FAKE_FOCUS_TRACE")" = '--set-config-value output=Off'
+      check test "$(grep -c eosviewfinder "$FAKE_FOCUS_TRACE" || true)" -eq 0
+    else
+      check grep -q -- "--set-config $interface=1 --capture-preview --stdout" "$FAKE_FOCUS_LOG"
+      check test "$(tail -n 1 "$FAKE_FOCUS_TRACE")" = "--set-config $interface=0"
+    fi
+    if [[ "$mode" != auto ]]; then
+      check test "$(grep -c 'autofocusdrive=1' "$FAKE_FOCUS_LOG" || true)" -eq 0
+    fi
+    check test "$(grep -Ec -- 'capture-image|capture-tethered|eosremoterelease' "$FAKE_FOCUS_TRACE" || true)" -eq 0
+  done
+done
+
+# Discovery/validation failures cannot reach ANY set-config or preview. A
+# query error is not permission to try another liveview path speculatively.
+export FAKE_FOCUS_INTERFACE=output
+for failure in FAKE_FOCUS_QUERY_EXIT=7 FAKE_FOCUS_READONLY=1 FAKE_FOCUS_MISSING_CHOICE=1 FAKE_FOCUS_MISSING_OFF=1 FAKE_FOCUS_INTERFACE=unknown; do
+  empty_logs
+  name="${failure%%=*}"; export "$failure"
+  if cr_focus_to_camera + >/dev/null 2>&1; then echo "Unexpected success: $failure" >&2; exit 1; fi
+  check test ! -s "$FAKE_FOCUS_LOG"
+  check test "$(grep -Ec -- '--set-config|--capture-preview' "$FAKE_FOCUS_TRACE" || true)" -eq 0
+  unset "$name"
+done
+empty_logs
+if cr_focus_to_camera 'auto;id' >/dev/null 2>&1; then exit 1; fi
+check test ! -s "$FAKE_FOCUS_TRACE"
+
+# A failed/partial move still leaves liveview and is NEVER repeated. Cleanup
+# failure is separately an error even when the drive itself returned success.
+for failure in FAKE_FOCUS_EXIT=8 FAKE_FOCUS_CLEANUP_EXIT=9; do
+  empty_logs
+  name="${failure%%=*}"; export "$failure"
+  rc=0; cr_focus_to_camera + >/dev/null 2>&1 || rc=$?
+  check test "$rc" -ne 0
+  check test "$(wc -l < "$FAKE_FOCUS_LOG")" -eq 1
+  check test "$(tail -n 1 "$FAKE_FOCUS_TRACE")" = '--set-config-value output=Off'
+  unset "$name"
+done
+empty_logs
+export FAKE_FOCUS_HANG=1 CAMERA_RPI_TIMEOUT_BIN="$PROJECT_DIR/tests/fixtures/fast-timeout"
+rc=0; cr_focus_to_camera + >/dev/null 2>&1 || rc=$?
+check test "$rc" -eq 124
+check test "$(wc -l < "$FAKE_FOCUS_LOG")" -eq 1
+check test "$(tail -n 1 "$FAKE_FOCUS_TRACE")" = '--set-config-value output=Off'
+echo "OK: $checks focus capability/sequence/cleanup checks; fake camera only"

@@ -1,0 +1,26 @@
+#!/bin/bash
+# Isolated admin activation test double. Never calls a real system service.
+set -euo pipefail
+: "${CAMERA_RPI_FAKE_SYSTEMCTL_DIR:?}"
+root=$CAMERA_RPI_FAKE_SYSTEMCTL_DIR
+if [[ ${1:-} == -n ]]; then echo rw; exit; fi # fake findmnt: fixture is writable
+printf '%s\n' "$*" >> "$root/calls"
+offline=0
+if [[ ${1:-} == --root=/ ]]; then offline=1; shift; fi
+# Model PID 1's RO mount separately from the bridge's writable namespace.
+# This catches the real PrivateTmp failure even when config writes succeed.
+case "$1" in
+  enable|disable|is-enabled) ((offline == 1)) || exit 30 ;;
+  *) ((offline == 0)) || exit 31 ;;
+esac
+[[ ${FAIL_ACTION:-} != "$1" ]] || exit 1
+case "$1" in
+  enable) printf '%s\n' "${ENABLE_STATE:-enabled}" > "$root/state" ;;
+  disable) echo disabled > "$root/state" ;;
+  is-enabled)
+    state=$(<"$root/state")
+    echo "$state"
+    [[ $state == enabled || $state == enabled-runtime ]] ;;
+  daemon-reload|start|restart|stop) ;;
+  *) exit 2 ;;
+esac

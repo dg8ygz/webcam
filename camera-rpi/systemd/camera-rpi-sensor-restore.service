@@ -1,0 +1,21 @@
+[Unit]
+Description=Restore archived sensor and climate history to RAM
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=camera-rpi-sensor.service camera-rpi-climate.service
+
+[Service]
+Type=oneshot
+# Pi has no battery-backed clock. Bound the wait so offline boot still works.
+ExecStartPre=-/usr/bin/timeout 30 /usr/lib/systemd/systemd-time-wait-sync
+ExecStart=/usr/local/libexec/camera-rpi-history-restore
+RemainAfterExit=yes
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/camera-rpi-status
+# Created by core tmpfiles; optional for legacy devices without the regulator.
+ReadWritePaths=-/run/camera-rpi-climate
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Pure parser/renderer tests. No real secrets, remote requests or hardware.
+set -euo pipefail
+project="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$project/ops/prepare-legacy-target.sh"
+source "$project/scripts/lib/camera-rpi-common.sh"
+stage="$(mktemp -d /tmp/camera-legacy-target-test.XXXXXXXX)"
+trap 'rm -rf -- "$stage"' EXIT
+umask 077
+count=0
+for value in 'wc_name="steinhagen"' "wc_name='steinhagen'" 'wc_name=steinhagen' \
+  'export wc_name="steinhagen" # comment'; do
+  printf '#wc_name="ignore"\n%s\n' "$value" > "$stage/source"
+  lt_read_literal "$stage/source" wc_name
+  [[ "$LT_VALUE" == steinhagen ]]
+  ((count+=1))
+done
+for value in 'wc_key="$(false)"' 'wc_key="${SECRET}"' 'wc_key="test"; false' \
+  'wc_key= test' 'wc_key=""' '#wc_key="test"' $'wc_key="test"\nwc_key="other"'; do
+  printf '%s\n' "$value" > "$stage/source"
+  if lt_read_literal "$stage/source" wc_key; then exit 1; fi
+  [[ ! -v LT_VALUE ]]
+  ((count+=1))
+done
+printf 'wc_adr="http://192.0.2.1/webcam/include"\r\nwc_key="FAKE"\r\n' > "$stage/source"
+lt_read_literal "$stage/source" wc_adr
+base="${LT_VALUE%/include}"
+lt_read_literal "$stage/source" wc_key
+printf '%s\n' "$LT_VALUE" > "$stage/key"
+unset LT_VALUE
+lt_render steinhagen-legacy steinhagen "$base" "$stage/key" > "$stage/target.conf"
+CAMERA_RPI_ALLOW_NONROOT_CONFIG=1
+cr_load_server_config "$stage/target.conf"
+cr_read_secret "$KEY_FILE"
+[[ "$CR_SECRET" == FAKE ]]
+unset CR_SECRET
+[[ "$ENABLED" == 0 && "$CAMERA_SLUG" == steinhagen && "$SERVER_ID" == steinhagen-legacy ]]
+[[ "$COMMAND_URL" == http://192.0.2.1/webcam/include/command.php ]]
+[[ "$UPLOAD_URL" == http://192.0.2.1/webcam/include/upload.php ]]
+[[ "$UPLOAD_MODE" == legacy && "$COMMAND_TIMEOUT_SECONDS" == 700 ]]
+[[ "$GPHOTO_CAPTURE_MODE" == eos-legacy ]]
+((count+=6))
+bash -n "$project/ops/prepare-legacy-target.sh"
+printf 'OK: %s legacy identity/key/config checks; no live services or hardware.\n' "$count"

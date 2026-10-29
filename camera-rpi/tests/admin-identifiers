@@ -1,0 +1,30 @@
+#!/bin/bash
+# Root bridge validation without sudo, live services, mounts or real secrets.
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d /tmp/camera-identifiers.XXXXXXXX)
+trap 'rm -rf -- "$stage"' EXIT
+mkdir -p "$stage/etc" "$stage/keys" "$stage/run"
+export CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_CONFIG_DIR="$stage/etc"
+export CAMERA_RPI_KEY_DIR="$stage/keys" CAMERA_RPI_RUNTIME_ROOT="$stage/run"
+export CAMERA_RPI_OPERATION_LOCK="$stage/lock"
+export CAMERA_RPI_COMMON_LIB="$repo/scripts/lib/camera-rpi-common.sh"
+save() {
+  printf 'action=save\nserver_id=%s\ncamera_slug=%s\nserver_base_url=https://fixture.invalid/webcam\nenabled=false\nkey_mode=replace\nkey=fixture-key-1234\n' "$1" "$2" |
+    bash "$repo/scripts/admin/camera-rpi-admin" > "$stage/out" 2> "$stage/err"
+}
+for id in a 0 steinhagen-prod cam--2; do save "$id" "$id"; done
+for id in '' Steinhagen cam_prod cam.prod -cam cam- 'cam prod' 'cam–prod' 'http://192.0.2.34/webcam2'; do
+  if save "$id" steinhagen; then echo 'Bad ID accepted'; exit 1; fi
+  grep -Fq 'Interner Name (Server-ID)' "$stage/err"
+  if save valid-id "$id"; then echo 'Bad slug accepted'; exit 1; fi
+  grep -Fq 'Webcam-Kennung' "$stage/err"
+done
+id48=$(printf 'a%.0s' {1..48})
+slug64=$(printf 'a%.0s' {1..64})
+save "$id48" "$slug64"
+if save "${id48}a" "$slug64"; then exit 1; fi
+grep -Fq 'Interner Name (Server-ID)' "$stage/err"
+if save valid-id "${slug64}a"; then exit 1; fi
+grep -Fq 'Webcam-Kennung' "$stage/err"
+echo 'OK: root bridge identifier grammar, length boundaries and field messages; no live actions'

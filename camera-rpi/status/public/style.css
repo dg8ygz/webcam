@@ -1,0 +1,100 @@
+:root {
+  color-scheme: dark;
+  --ink: #f4f7f4;
+  --muted: #a9b5b0;
+  --ground: #07110f;
+  --card: #101d1a;
+  --line: #273833;
+  --green: #65d1a7;
+  --blue: #65b9e8;
+  --amber: #efbd62;
+  --red: #ef7770;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: radial-gradient(circle at top, #173129, var(--ground) 42rem); color: var(--ink); }
+main { width: min(1120px, calc(100% - 28px)); margin: 0 auto; padding: 32px 0 60px; }
+.page-head, .section-head, .overlay, .overlay-values, .legend { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.page-head { margin-bottom: 22px; }
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: 0; font-size: clamp(2rem, 6vw, 3.8rem); letter-spacing: -.055em; }
+h2 { margin-bottom: 6px; }
+.eyebrow { margin-bottom: 6px; color: var(--green); font-size: .73rem; font-weight: 850; letter-spacing: .14em; text-transform: uppercase; }
+.refresh { color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; font-size: .82rem; }
+.hero { position: relative; min-height: 360px; overflow: hidden; border: 1px solid var(--line); border-radius: 24px; background: #0b1513; box-shadow: 0 24px 70px rgb(0 0 0 / 35%); }
+.hero img { display: block; width: 100%; max-height: 680px; object-fit: cover; }
+.image-empty { display: grid; min-height: 420px; place-items: center; color: var(--muted); }
+.overlay { position: absolute; inset: auto 0 0; padding: 44px 24px 22px; background: linear-gradient(transparent, rgb(0 0 0 / 82%)); align-items: end; }
+.overlay span { display: block; color: #d5dedb; font-size: .8rem; margin-bottom: 5px; }
+.overlay strong { font-size: clamp(1rem, 3vw, 1.45rem); }
+.overlay-values strong { padding: 8px 11px; border: 1px solid rgb(255 255 255 / 25%); border-radius: 10px; background: rgb(4 13 11 / 65%); }
+.chart-card { border: 1px solid var(--line); border-radius: 18px; background: rgb(16 29 26 / 92%); }
+.hero + .chart-card { margin-top: 18px; }
+.updated, .empty { color: var(--muted); line-height: 1.5; }
+.page-head { flex-wrap: wrap; }
+.climate-fault { flex-basis: 100%; border: 1px solid var(--red); border-radius: 10px; padding: 14px; background: #351f1f; overflow-wrap: anywhere; }
+.climate-fault p { margin: 8px 0 0; line-height: 1.5; }
+.climate-fault a { color: var(--ink); text-decoration: underline; }
+.chart-card { padding: 22px; }
+.legend { justify-content: flex-end; color: var(--muted); font-size: .84rem; }
+.legend span::before { content: ''; display: inline-block; width: 22px; height: 3px; margin-right: 7px; vertical-align: middle; border-radius: 3px; background: var(--green); }
+.legend .humidity::before { background: var(--blue); }
+.chart { display: block; width: 100%; min-height: 250px; margin-top: 12px; }
+.grid line { stroke: #2a3b36; stroke-width: 1; }
+.chart polyline { fill: none; stroke-linejoin: round; stroke-linecap: round; stroke-width: 4; vector-effect: non-scaling-stroke; }
+.temperature-line { stroke: var(--green); }
+.humidity-line { stroke: var(--blue); }
+.chart text { fill: var(--muted); font-size: 13px; }
+/* Tooltip stays inside its chart on narrow displays. Pointer events pass
+ * through it so hovering high/low on the plot always selects by time only. */
+.chart-interactive { position: relative; }
+.chart-interactive svg { cursor: crosshair; touch-action: pan-y; }
+.chart-interactive svg:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.chart-cursor { stroke: var(--ink); stroke-width: 1; stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; pointer-events: none; }
+.chart-tooltip { position: absolute; z-index: 2; top: 6px; right: 10px; max-width: calc(100% - 20px); padding: 10px 13px; border: 1px solid var(--muted); border-radius: 9px; background: rgb(7 17 15 / 96%); pointer-events: none; font-size: .85rem; box-shadow: 0 4px 16px #0006; }
+.chart-tooltip[hidden] { display: none; }
+.chart-tooltip strong, .chart-tooltip span, .chart-tooltip small { display: block; }
+.chart-tooltip strong { margin-bottom: 5px; }
+.chart-tooltip small { margin-top: 5px; color: var(--muted); }
+.chart-tooltip .value-dew, .chart-tooltip .value-humidity { color: var(--blue); }
+.chart-tooltip .value-gap, .chart-tooltip .value-temperature { color: var(--green); }
+.chart-tooltip .value-pwm { color: var(--amber); }
+.chart-tooltip .value-heater { color: var(--red); }
+.updated { margin: 6px 0 0; font-size: .82rem; }
+.climate-overview { margin-top: 18px; }
+.climate-history { margin-top: 18px; }
+.climate-chart { min-height: 0; }
+.climate-legend { flex-wrap: wrap; justify-content: flex-start; gap: 10px 16px; }
+/* Match label, marker and curve colors; the general legend uses muted text. */
+.climate-legend .dew { color: var(--blue); }
+.climate-legend .gap { color: var(--green); }
+.climate-legend .pwm { color: var(--amber); }
+.climate-legend .heater { color: var(--red); }
+.climate-legend span::before { background: currentColor; }
+.climate-line { fill: none; stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.dew-line { stroke: var(--blue); }
+.gap-line { stroke: var(--green); }
+.pwm-line { stroke: var(--amber); }
+.heater-line { stroke: var(--red); }
+.mode-simulate { stroke-dasharray: 6 4; }
+.climate-overview > p { color: var(--muted); line-height: 1.5; }
+.table-scroll { overflow-x: auto; margin-bottom: 16px; }
+.table-scroll:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.climate-table { border-collapse: collapse; width: 100%; min-width: 300px; table-layout: fixed; text-align: left; }
+.climate-table th, .climate-table td { padding: 12px; border-bottom: 1px solid var(--line); }
+.climate-table th { color: var(--muted); font-size: .85rem; font-weight: 600; }
+.climate-table td { font-size: 1.3rem; font-weight: 700; white-space: nowrap; }
+
+@media (max-width: 760px) {
+  main { width: min(100% - 18px, 1120px); padding-top: 18px; }
+  .page-head, .section-head { align-items: flex-start; flex-direction: column; }
+  .hero { min-height: 300px; }
+  .hero img, .image-empty { min-height: 300px; }
+  .overlay { align-items: flex-start; flex-direction: column; padding-inline: 16px; }
+  .chart-card { padding: 16px; }
+  .climate-chart text { font-size: 26px; }
+  .climate-table th, .climate-table td { padding: 10px 5px; }
+  .climate-table th { font-size: .75rem; }
+  .climate-table td { font-size: 1rem; }
+}

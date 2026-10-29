@@ -1,0 +1,7 @@
+MAILTO=
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# LEGACY/DISABLED: Backup laeuft intern ueber Kamera-Poll + Admin > Scripte.
+# LEGACY 03:10 - darf nicht parallel zum internen Lauf aktiv bleiben.
+# 10 3 * * * www-data cd /var/www/html/webcam && php bin/backup_daily.php --verbose >> /var/www/html/webcam/var/log/backup_daily.log 2>&1

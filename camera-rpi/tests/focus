@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-rpi-focus.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+fail() { echo "FEHLER: $*" >&2; exit 1; }
+mkdir -p "$STAGE/etc" "$STAGE/keys" "$STAGE/run" "$STAGE/spool"
+export CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_CONFIG_DIR="$STAGE/etc" CAMERA_RPI_KEY_DIR="$STAGE/keys"
+export CAMERA_RPI_RUNTIME_ROOT="$STAGE/run" CAMERA_RPI_OPERATION_LOCK="$STAGE/operation.lock"
+export CAMERA_RPI_ADMIN_TEST_MODE=1
+export CAMERA_RPI_CURL_BIN="$PROJECT_DIR/tests/fixtures/fake-curl"
+export CAMERA_RPI_GPHOTO_BIN="$PROJECT_DIR/tests/fixtures/fake-focus"
+export CAMERA_RPI_STATUS_ROOT="$STAGE/status" CAMERA_RPI_STATUS_GROUP=''
+export FAKE_CURL_ARGUMENT_LOG="$STAGE/curl.log" FAKE_FOCUS_LOG="$STAGE/focus.log"
+export FAKE_UPLOAD_LOG="$STAGE/uploads.log" FAKE_COMMAND_MODE=focus
+chmod +x "$CAMERA_RPI_CURL_BIN" "$CAMERA_RPI_GPHOTO_BIN" "$PROJECT_DIR/tests/fixtures/fast-timeout"
+{
+  printf 'action=save\nserver_id=server-three\nserver_base_url=http://server-three.invalid/webcam\ncamera_slug=test\nenabled=true\nkey_mode=replace\nkey=key-three-333333\n'
+} | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin" >/dev/null
+sed -i -e 's/^manage_root_mount=.*/manage_root_mount=0/' -e "s|^spool_root=.*|spool_root=$STAGE/spool|" "$STAGE/etc/server-three.conf"
+worker() { bash "$PROJECT_DIR/scripts/camera-rpi-worker" --once "$STAGE/etc/server-three.conf"; }
+export FAKE_CAPTURE_SERIAL="$(date +%s)"
+for mode in -- - auto + ++; do
+  export FAKE_FOCUS_MODE="$mode"
+  worker > "$STAGE/worker.log" 2>&1 || { cat "$STAGE/worker.log"; fail "$mode failed"; }
+done
+[[ $(wc -l < "$FAKE_FOCUS_LOG") == 5 ]] || fail 'Missing modes'
+for value in 'Near 1' 'Near 2' 'Far 1' 'Far 2'; do
+  grep -Fxq -- "--set-config-value evfmode=1 --set-config-value output=PC --capture-preview --stdout --set-config-value manualfocusdrive=$value" "$FAKE_FOCUS_LOG" || fail "Mapping $value"
+done
+grep -Fxq -- '--set-config-value evfmode=1 --set-config-value output=PC --capture-preview --stdout --set-config autofocusdrive=1 --wait-event=2s' "$FAKE_FOCUS_LOG" || fail 'Autofocus'
+worker >/dev/null 2>&1 || fail 'Duplicate handling'
+[[ $(wc -l < "$FAKE_FOCUS_LOG") == 5 ]] || fail 'Repeated relative move'
+for mode in 'auto;id' 'webcam_capture' +++ $'auto\nwebcam_capture'; do
+  export FAKE_FOCUS_MODE="$mode"
+  if worker > /dev/null 2>&1; then fail "Bad mode accepted $mode"; fi
+done
+export FAKE_FOCUS_MODE=auto FAKE_CAPTURE_SERIAL=1000000000
+if worker >/dev/null 2>&1; then fail 'Stale focus accepted'; fi
+[[ $(wc -l < "$FAKE_FOCUS_LOG") == 5 && ! -s "$FAKE_UPLOAD_LOG" ]] || fail 'Invalid action/unsolicited capture'
+export FAKE_CAPTURE_SERIAL="$(date +%s)" FAKE_FOCUS_MODE=auto FAKE_FOCUS_EXIT=8
+if worker >/dev/null 2>&1; then fail 'Camera error accepted'; fi
+grep -qx exit_code=8 "$STAGE/run/server-three/focus.status" || fail 'Error missing'
+unset FAKE_FOCUS_EXIT
+worker >/dev/null 2>&1 || fail 'Error replay handling'
+[[ $(wc -l < "$FAKE_FOCUS_LOG") == 6 ]] || fail 'Failed relative movement retried'
+export FAKE_FOCUS_MODE=+ FAKE_FOCUS_HANG=1
+if CAMERA_RPI_TIMEOUT_BIN="$PROJECT_DIR/tests/fixtures/fast-timeout" worker >/dev/null 2>&1; then fail 'Timeout missing'; fi
+unset FAKE_FOCUS_HANG
+grep -qx exit_code=124 "$STAGE/run/server-three/focus.status" || fail 'Timeout status'
+printf 'action=focus\nserver_id=server-three\nfocus_mode=--\n' | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin" >/dev/null
+[[ -s "$STAGE/run/server-three/focus.request" && ! -e "$STAGE/run/other/focus.request" ]] || fail 'Local scope'
+if printf 'action=focus\nserver_id=server-three\nfocus_mode=+\n' | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin" >/dev/null 2>&1; then fail 'Local overwrite'; fi
+FAKE_COMMAND_MODE=wait worker >/dev/null 2>&1 || fail 'Local focus'
+sed -i 's/^capture_backend=.*/capture_backend=v4l2/' "$STAGE/etc/server-three.conf"
+export CAMERA_RPI_V4L2_BIN="$PROJECT_DIR/tests/fixtures/fake-v4l2-ctl" FAKE_FOCUS_MODE=auto
+if worker >/dev/null 2>&1; then fail 'V4L2 remote accepted'; fi
+if printf 'action=focus\nserver_id=server-three\nfocus_mode=auto\n' | bash "$PROJECT_DIR/scripts/admin/camera-rpi-admin" >/dev/null 2>&1; then fail 'V4L2 local accepted'; fi
+echo 'OK: Fokus remote/lokal, Mapping, Kamerasperre, Scope, Replay, Grenzen, Fehler, Timeout und V4L2-Ablehnung'

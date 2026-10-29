@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+# Erzeugt im Test ein kleines dekodierbares JPEG. Das
+# Verzeichnis FAKE_CAMERA_ACTIVE beweist zugleich, dass niemals zwei
+# GPhoto-Prozesse gleichzeitig laufen.
+
+set -uo pipefail
+
+filename=""
+expect_filename=0
+for argument in "$@"; do
+  if (( expect_filename == 1 )); then filename="$argument"; expect_filename=0; continue; fi
+  [[ "$argument" == "--filename" ]] && expect_filename=1
+done
+[[ -n "$filename" ]] || exit 2
+
+if [[ -n "${FAKE_SLOW_UPLOAD_MARKER:-}" && -e "$FAKE_SLOW_UPLOAD_MARKER" ]]; then
+  printf 'capture-waehrend-upload\n' >> "$FAKE_CAPTURE_DURING_UPLOAD_LOG"
+fi
+
+if ! mkdir "$FAKE_CAMERA_ACTIVE" 2>/dev/null; then
+  printf 'Kamera wurde gleichzeitig benutzt\n' >> "$FAKE_CAMERA_OVERLAP_LOG"
+  exit 9
+fi
+trap 'rmdir "$FAKE_CAMERA_ACTIVE" 2>/dev/null || true' EXIT
+
+if [[ "${FAKE_GPHOTO_FAIL:-0}" == "1" ]]; then
+  printf '%s\tfailure\n' "$(date +%s%N)" >> "$FAKE_GPHOTO_LOG"
+  printf 'simulierter Kamerafehler\n' >&2
+  exit 8
+fi
+
+printf '%s\tstart\n' "$(date +%s%N)" >> "$FAKE_GPHOTO_LOG"
+cp -- "$(dirname -- "${BASH_SOURCE[0]}")/capture.jpg" "$filename"
+if [[ ${FAKE_IMAGE_INVALID:-0} == 1 ]]; then
+  { printf '\377\330'; head -c 1020 /dev/zero; printf '\377\331'; } > "$filename"
+fi
+sleep 0.2
+printf '%s\tend\n' "$(date +%s%N)" >> "$FAKE_GPHOTO_LOG"

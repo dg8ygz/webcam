@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Exercise real read(2) EIO and recovery without accessing sensor hardware.
+set -euo pipefail
+umask 077
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d)"
+SENSOR_PID=''
+cleanup() {
+  if [[ -n "$SENSOR_PID" ]]; then
+    kill "$SENSOR_PID" 2>/dev/null || true
+    wait "$SENSOR_PID" 2>/dev/null || true
+  fi
+  rm -rf -- "$STAGE"
+}
+trap cleanup EXIT
+
+# At offset zero, our own /proc/self/mem is readable but read(2) fails with
+# EIO. Confirm this fixture instead of silently testing only a missing file.
+python3 - <<'PY'
+import errno
+with open('/proc/self/mem', 'rb', buffering=0) as stream:
+    try:
+        stream.read(1)
+    except OSError as exc:
+        assert exc.errno == errno.EIO, exc
+    else:
+        raise AssertionError('Expected EIO at address zero')
+PY
+ln -s /proc/self/mem "$STAGE/temperature"
+printf '53600\n' > "$STAGE/humidity"
+printf '21400\n' > "$STAGE/valid-temperature"
+printf 'enabled=true\nsample_seconds=2\ntemperature_file=%s\nhumidity_file=%s\n' \
+  "$STAGE/temperature" "$STAGE/humidity" > "$STAGE/device.conf"
+CAMERA_RPI_SENSOR_TEST_MODE=1 CAMERA_RPI_STATUS_GROUP='' \
+  CAMERA_RPI_STATUS_ROOT="$STAGE/status" \
+  bash "$PROJECT_DIR/scripts/camera-rpi-sensor" "$STAGE/device.conf" \
+  > "$STAGE/output" 2>&1 &
+SENSOR_PID=$!
+
+wait_for_status() {
+  local expected="$1" attempt
+  for attempt in {1..100}; do
+    if ! kill -0 "$SENSOR_PID" 2>/dev/null; then
+      cat "$STAGE/output" >&2
+      printf 'Sensor exited before reaching %s\n' "$expected" >&2
+      exit 1
+    fi
+    if grep -qx "sensor_state=$expected" "$STAGE/status/current.status" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf 'Timed out waiting for %s\n' "$expected" >&2
+  exit 1
+}
+wait_for_status error
+grep -qx 'temperature_c=' "$STAGE/status/current.status"
+test ! -e "$STAGE/status/history.tsv"
+ln -s "$STAGE/valid-temperature" "$STAGE/replacement"
+mv -Tf "$STAGE/replacement" "$STAGE/temperature"
+wait_for_status ok
+grep -qx 'temperature_c=21.4' "$STAGE/status/current.status"
+grep -qx 'humidity_percent=53.6' "$STAGE/status/current.status"
+printf 'OK: Sensor survives EIO, publishes error, and recovers in the same process\n'

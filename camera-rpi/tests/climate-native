@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Compile native actuator with an EXPLICIT test-only backend. --test cannot open
+# /dev/gpiochip*. Production build does not accept this switch at all.
+set -euo pipefail
+SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-climate-native.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+cc -O2 -Wall -Wextra -Werror -DCLIMATE_TEST -o "$STAGE/pwm-test" "$SRC/scripts/native/camera-rpi-pwm.c"
+cc -O2 -Wall -Wextra -Werror -o "$STAGE/pwm" "$SRC/scripts/native/camera-rpi-pwm.c"
+"$STAGE/pwm" --version
+if "$STAGE/pwm" --test > /dev/null 2>&1; then echo 'Production accepted test mode' >&2; exit 1; fi
+if "$STAGE/pwm" --test-power 6 "$STAGE/control.sock" > /dev/null 2>&1; then echo 'Production accepted power test mode' >&2; exit 1; fi
+if "$STAGE/pwm" --test-focus 13 "$STAGE/control.sock" > /dev/null 2>&1; then echo 'Production accepted focus test mode' >&2; exit 1; fi
+php "$SRC/tests/climate-native.php" "$STAGE/pwm-test" "$STAGE"
+php "$SRC/tests/power.php" "$STAGE/pwm-test" "$STAGE"

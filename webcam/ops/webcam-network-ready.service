@@ -1,0 +1,17 @@
+[Unit]
+Description=Wait for .34 IPv4 address and route to the webcam NAS
+DefaultDependencies=no
+Wants=network.target
+After=network.target
+Before=network-online.target shutdown.target
+Conflicts=shutdown.target
+ConditionHost=db0bi-webcamsrv-test
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/webcam-boot-guard wait-network
+TimeoutStartSec=70
+RemainAfterExit=yes
+
+[Install]
+WantedBy=network-online.target

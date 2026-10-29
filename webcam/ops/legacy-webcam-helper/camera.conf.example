@@ -1,0 +1,48 @@
+# Eine Datei je simulierter Kamera, beispielsweise:
+# /etc/webcam-legacy-helper/bielefeld.conf
+
+CAMERA_SLUG="bielefeld"
+
+# Öffentlicher Basis-URL der PROD-Installation inklusive Alias/Prefix.
+PROD_BASE_URL="https://prod.example.invalid/webcam2"
+
+# Derselbe geheime upload_key, der für diese Kamera in PROD konfiguriert ist.
+UPLOAD_KEY="REPLACE_WITH_CAMERA_UPLOAD_KEY"
+
+# Variante A: Der Helper bildet daraus
+# http://legacy.example.invalid/<SOURCE_SLUG>/current/raw.jpg
+LEGACY_BASE_URL="http://legacy.example.invalid"
+SOURCE_SLUG="bielefeld"
+
+# Variante B für einen abweichenden vollständigen Pfad; überschreibt Variante A.
+# SOURCE_URL="http://legacy.example.invalid/bielefeld/current/raw.jpg"
+
+POLL_SECONDS=5
+ERROR_BACKOFF_SECONDS=20
+CONNECT_TIMEOUT_SECONDS=10
+COMMAND_TIMEOUT_SECONDS=30
+SOURCE_TIMEOUT_SECONDS=30
+UPLOAD_TIMEOUT_SECONDS=90
+
+# "auto" handelt Chunk-v1 aus und fällt nur bei einer ausdruecklich nicht
+# vorhandenen/abweichenden Capability auf den Legacy-Upload zurück.
+# "chunk" verlangt Chunk-v1, "legacy" deaktiviert die Aushandlung bewusst.
+UPLOAD_TRANSPORT="auto"
+CHUNK_TIMEOUT_SECONDS=30
+CHUNK_RETRY_COUNT=3
+CHUNK_RETRY_DELAY_SECONDS=2
+
+# Das Alt-System aktualisiert current/raw.jpg zeitversetzt nach dem eigentlichen
+# Slot. Der Helper bewahrt den PROD-Zeitstempel, wartet aber mit dem Abruf.
+SOURCE_DELAY_SECONDS=210
+
+# Ein noch nicht geladenes Quellbild wird höchstens so lange dem alten Slot
+# zugeordnet. Danach bleibt ein sichtbarer Marker unter failed/ erhalten.
+MAX_SOURCE_AGE_SECONDS=900
+
+MIN_IMAGE_BYTES=1024
+MAX_IMAGE_BYTES=26214400
+
+# Optional bei eigener CA. TLS-Prüfung wird nicht abgeschaltet.
+# PROD_CA_CERT="/etc/ssl/certs/internal-ca.pem"
+# SOURCE_CA_CERT="/etc/ssl/certs/internal-ca.pem"

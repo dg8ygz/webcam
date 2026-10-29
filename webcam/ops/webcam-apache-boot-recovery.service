@@ -1,0 +1,14 @@
+[Unit]
+Description=Retry the initial Apache start after transient boot mount failure
+Wants=network-online.target
+After=network-online.target apache2.service
+ConditionHost=db0bi-webcamsrv-test
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/webcam-boot-guard recover-apache
+TimeoutStartSec=360
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

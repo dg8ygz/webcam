@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Fixture filesystem only: publication, exact snapshots and rollback preserve
+# unrelated credentials and JPEGs. No live services, remounts or camera access.
+set -euo pipefail
+umask 077
+project="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$project/ops/update-capture-pool.sh"
+source "$project/ops/update-eos-legacy.sh"
+source "$project/ops/lib/legacy-install.sh"
+stage="$(mktemp -d /tmp/camera-pool-update-test.XXXXXXXX)"
+trap 'rm -rf -- "$stage"' EXIT
+LI_ROOT="$stage/root"
+up_paths
+for relative in "${UE_PATHS[@]}"; do mkdir -p "$LI_ROOT/$(dirname "$relative")"; done
+mkdir -p "$LI_ROOT/etc/camera-rpi/keys" "$LI_ROOT/var/lib/camera-rpi/spool/test/images"
+printf 'private-test-key\n' > "$LI_ROOT/etc/camera-rpi/keys/test.key"
+printf 'unchanged-jpeg\n' > "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789247400.jpg"
+printf 'old-worker\n' > "$LI_ROOT/usr/local/libexec/camera-rpi-worker"
+chmod 0755 "$LI_ROOT/usr/local/libexec/camera-rpi-worker"
+before="$(sha256sum "$LI_ROOT/etc/camera-rpi/keys/test.key" "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789247400.jpg")"
+ue_snapshot "$stage/before"
+for i in "${!UE_PATHS[@]}"; do
+  ue_publish_file "$project/${UE_SOURCES[$i]}" "${UE_PATHS[$i]}" "${UE_MODES[$i]}"
+  cmp "$project/${UE_SOURCES[$i]}" "$LI_ROOT/${UE_PATHS[$i]}"
+done
+up_baseline
+[[ "$(stat -c %a "$LI_ROOT/etc/camera-rpi/capture-pool.conf")" == 600 ]]
+[[ "$(stat -c %a "$LI_ROOT/usr/local/libexec/camera-rpi-worker")" == 755 ]]
+printf 'unexpected-hotfix\n' > "$LI_ROOT/usr/local/libexec/camera-rpi-worker"
+if up_baseline >/dev/null 2>&1; then echo 'Unknown hotfix accepted'; exit 1; fi
+ue_restore "$stage/before" "$stage/after"
+cmp "$stage/before/usr/local/libexec/camera-rpi-worker" "$LI_ROOT/usr/local/libexec/camera-rpi-worker"
+[[ ! -e "$LI_ROOT/etc/camera-rpi/capture-pool.conf" ]]
+[[ -f "$stage/after/removed/etc/camera-rpi/capture-pool.conf" ]]
+[[ "$before" == "$(sha256sum "$LI_ROOT/etc/camera-rpi/keys/test.key" "$LI_ROOT/var/lib/camera-rpi/spool/test/images/1789247400.jpg")" ]]
+# Stub every service query, including query failure and nonzero control PID.
+systemctl() {
+  [[ "${TEST_QUERY_FAIL:-0}" == 0 ]] || return 1
+  case "$*" in
+    list-units*) [[ "${TEST_OTHER:-0}" == 0 ]] || echo 'other worker active' ;;
+    *ActiveState*) echo "${TEST_ACTIVE:-inactive}" ;;
+    *MainPID*) echo "${TEST_PID:-0}" ;;
+    *ControlPID*) echo "${TEST_CONTROL:-0}" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+up_stopped
+TEST_ACTIVE=failed up_stopped
+for fault in TEST_QUERY_FAIL=1 TEST_OTHER=1 TEST_ACTIVE=active TEST_PID=123 TEST_CONTROL=456; do
+  if (export "$fault"; up_stopped) >/dev/null 2>&1; then echo "Unsafe guard: $fault"; exit 1; fi
+done
+echo 'OK: Pool updater publication/permissions/baseline/rollback/service guards; keys and JPEG unchanged; no live services'

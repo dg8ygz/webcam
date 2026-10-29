@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Keine Installation: APT/Mountabfrage sind isolierte Testprogramme.
+set -euo pipefail
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TEST_STAGE="$(mktemp -d /tmp/camera-rpi-preflight.XXXXXXXX)"
+trap 'rm -rf -- "$TEST_STAGE"' EXIT
+mkdir -p "$TEST_STAGE/bin" "$TEST_STAGE/servers"
+cat > "$TEST_STAGE/bin/findmnt" <<'SH'
+#!/bin/sh
+printf '%s\n' "${TEST_ROOT_MODE:-rw},relatime"
+SH
+cat > "$TEST_STAGE/bin/apt-get" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_APT_LOG"
+# Der Test darf ausschliesslich die Simulation aufrufen.
+[ "$1" = --simulate ] || exit 97
+SH
+chmod 0755 "$TEST_STAGE/bin/"*
+export TEST_APT_LOG="$TEST_STAGE/apt.log"
+export PATH="$TEST_STAGE/bin:$PATH"
+if (( EUID == 0 )); then
+  bash "$PROJECT_DIR/install.sh" --core --web cameraadmin --packages --check > "$TEST_STAGE/check.log"
+  grep -q '^--simulate install --no-install-recommends .*gphoto2.*libapache2-mod-php' "$TEST_APT_LOG"
+  [[ "$(wc -l < "$TEST_APT_LOG")" -eq 1 ]]
+  if TEST_ROOT_MODE=ro bash "$PROJECT_DIR/install.sh" --core --packages --check > "$TEST_STAGE/ro.log" 2>&1; then
+    printf 'FEHLER: Paketweg akzeptiert RO-System\n' >&2; exit 1
+  fi
+  [[ "$(wc -l < "$TEST_APT_LOG")" -eq 1 ]]
+  printf 'OK: Trixie-Paketprüfung simuliert APT und verweigert RO ohne APT-Aufruf\n'
+  bash "$PROJECT_DIR/install.sh" --core --packages --with-v4l2 --check > "$TEST_STAGE/video.log"
+  grep -q '^--simulate install --no-install-recommends .*gphoto2.*v4l-utils' "$TEST_APT_LOG"
+  [[ "$(wc -l < "$TEST_APT_LOG")" -eq 2 ]]
+  printf 'OK: V4L2-Paketoption ergaenzt v4l-utils ohne gphoto2 zu ersetzen\n'
+else
+  printf 'SKIP: Installer-Pruefung benoetigt root (nur Stubs, keine Installation)\n'
+fi
+export CAMERA_RPI_CONFIG_DIR="$TEST_STAGE/servers"
+export CAMERA_RPI_SENSOR_CONFIG="$TEST_STAGE/missing.conf"
+export CAMERA_RPI_FINDMNT_BIN="$TEST_STAGE/bin/findmnt"
+health_exit() {
+  local expected="$1" actual=0
+  shift
+  bash "$PROJECT_DIR/scripts/camera-rpi-healthcheck" "$@" > "$TEST_STAGE/health.log" || actual=$?
+  [[ "$actual" -eq "$expected" ]] || { cat "$TEST_STAGE/health.log"; exit 1; }
+}
+# Ohne Zielserver bleibt WARNING=1; falscher Mountmodus muss CRITICAL=2 sein.
+health_exit 1 --expect-root=rw
+health_exit 2
+TEST_ROOT_MODE=ro health_exit 1
+TEST_ROOT_MODE=ro health_exit 2 --expect-root=rw
+if bash "$PROJECT_DIR/scripts/camera-rpi-healthcheck" --expect-root=anything > /dev/null 2>&1; then
+  exit 1
+fi
+printf 'OK: Healthcheck prueft explizites RW; Standard bleibt strikt RO\n'

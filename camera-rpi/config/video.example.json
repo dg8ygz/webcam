@@ -1,0 +1,12 @@
+{
+  "control_url": "https://webcam.example.invalid/testx/include/video-command.php",
+  "camera_slug": "test",
+  "key_file": "/etc/camera-rpi/keys/dev-test.key",
+  "tunnel_url": "https://webcam.example.invalid/camera-maintenance/video/",
+  "fingerprint": "REPLACE_WITH_SEPARATE_VIDEO_RELAY_FINGERPRINT",
+  "auth": "REPLACE_WITH_VIDEO_ONLY_CREDENTIAL",
+  "port": 23001,
+  "token": "REPLACE_WITH_RANDOM_64_HEX_TOKEN",
+  "device": "/dev/video0",
+  "input_fps": 30
+}

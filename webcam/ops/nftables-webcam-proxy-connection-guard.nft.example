@@ -1,0 +1,58 @@
+# Frueher TCP-Schutz fuer den gemeinsam genutzten oeffentlichen Apache.
+#
+# An dieser Schicht ist der HTTPS-Pfad noch verschluesselt. Die Regeln gelten
+# deshalb bewusst fuer den gesamten Frontend-Listener auf Port 80 und 443 und
+# verwenden konservative, browser- und streamtaugliche Grenzen. Die eigene
+# Tabelle kollidiert nicht mit den dynamisch von Fail2Ban angelegten Tabellen.
+
+table inet webcam_proxy_guard {
+  # Die Rate-Sets fuehren pro Quelladresse einen eigenen Token-Bucket. Nach
+  # einer Minute ohne neue Verbindung verschwindet der Eintrag automatisch.
+  set frontend_rate_v4 {
+    type ipv4_addr
+    flags dynamic,timeout
+    timeout 1m
+    size 65535
+  }
+
+  set frontend_rate_v6 {
+    type ipv6_addr
+    flags dynamic,timeout
+    timeout 1m
+    size 65535
+  }
+
+  # Conntrack loescht diese Elemente zusammen mit den zugehoerigen
+  # Verbindungen. Fuer ct count darf deshalb absichtlich kein Set-Timeout
+  # gesetzt und nur "add", nicht "update", verwendet werden.
+  set frontend_connections_v4 {
+    type ipv4_addr
+    flags dynamic
+    size 65535
+  }
+
+  set frontend_connections_v6 {
+    type ipv6_addr
+    flags dynamic
+    size 65535
+  }
+
+  chain input {
+    type filter hook input priority -10; policy accept;
+
+    # Lokale Healthchecks duerfen die Schutzzaehler nicht fuellen.
+    iifname "lo" return
+
+    # Mehr als 30 neue Frontend-Verbindungen pro Sekunde und Quell-IP werden
+    # nach einem grosszuegigen Burst von 60 verworfen. Bestehende Sessions sind
+    # davon nicht betroffen.
+    meta nfproto ipv4 ct state new tcp dport { 80, 443 } update @frontend_rate_v4 { ip saddr timeout 1m limit rate over 30/second burst 60 packets } counter drop
+    meta nfproto ipv6 ct state new tcp dport { 80, 443 } update @frontend_rate_v6 { ip6 saddr timeout 1m limit rate over 30/second burst 60 packets } counter drop
+
+    # Ein einzelner externer Absender darf maximal 64 nachverfolgte Frontend-
+    # Verbindungen gleichzeitig belegen. Damit kann eine IP den prefork-Pool
+    # mit 150 MaxRequestWorkers nicht allein ausschoepfen.
+    meta nfproto ipv4 ct state new tcp dport { 80, 443 } add @frontend_connections_v4 { ip saddr ct count over 64 } counter drop
+    meta nfproto ipv6 ct state new tcp dport { 80, 443 } add @frontend_connections_v6 { ip6 saddr ct count over 64 } counter drop
+  }
+}

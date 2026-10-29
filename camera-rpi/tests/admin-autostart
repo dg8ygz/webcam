@@ -1,0 +1,66 @@
+#!/bin/bash
+# Run the real non-test activation branch against isolated filesystem/systemctl
+# doubles. The usual TEST_MODE bypass would miss errors in this exact branch.
+set -euo pipefail
+umask 077
+repo=$(cd "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d "${TMPDIR:-/tmp}/camera-admin-autostart.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+mkdir -p "$stage/servers" "$stage/keys" "$stage/run"
+chmod 0755 "$repo/tests/fixtures/fake-admin-systemctl"
+checks=0
+check() { "$@" || { echo "FAIL: $*" >&2; exit 1; }; ((checks+=1)); }
+run() {
+  env CAMERA_RPI_ADMIN_TEST_MODE=0 CAMERA_RPI_CONFIG_DIR="$stage/servers" \
+    CAMERA_RPI_SOURCE_CONFIG="$stage/no-source" CAMERA_RPI_POOL_CONFIG="$stage/no-pool" \
+    CAMERA_RPI_KEY_DIR="$stage/keys" CAMERA_RPI_RUNTIME_ROOT="$stage/run" \
+    CAMERA_RPI_OPERATION_LOCK="$stage/operation.lock" \
+    CAMERA_RPI_COMMON_LIB="$repo/scripts/lib/camera-rpi-common.sh" \
+    CAMERA_RPI_SYSTEMCTL_BIN="$repo/tests/fixtures/fake-admin-systemctl" \
+    CAMERA_RPI_FINDMNT_BIN="$repo/tests/fixtures/fake-admin-systemctl" \
+    CAMERA_RPI_MOUNT_BIN=/usr/bin/false CAMERA_RPI_FAKE_SYSTEMCTL_DIR="$stage" \
+    FAIL_ACTION="${FAIL_ACTION:-}" ENABLE_STATE="${ENABLE_STATE:-enabled}" \
+    bash "$repo/scripts/admin/camera-rpi-admin" > "$stage/out" 2> "$stage/err"
+}
+save() {
+  printf 'action=save\nserver_id=fixture\nserver_base_url=https://fixture.invalid/webcam\ncamera_slug=fixture\nenabled=true\nkey_mode=replace\nkey=fixture-key-1234\n' | run
+}
+activate() { printf 'action=set_enabled\nserver_id=fixture\nenabled=%s\n' "$1" | run; }
+check save
+check grep -Fxq -- '--root=/ enable camera-rpi-worker@fixture.service' "$stage/calls"
+check grep -Fxq -- '--root=/ is-enabled camera-rpi-worker@fixture.service' "$stage/calls"
+check grep -Fxq 'start camera-rpi-worker@fixture.service' "$stage/calls"
+check test "$(<"$stage/state")" = enabled
+check save
+check grep -Fxq 'restart camera-rpi-worker@fixture.service' "$stage/calls"
+check activate false
+check grep -Fxq -- '--root=/ disable camera-rpi-worker@fixture.service' "$stage/calls"
+check grep -Fxq 'stop camera-rpi-worker@fixture.service' "$stage/calls"
+check test "$(<"$stage/state")" = disabled
+check grep -Fxq enabled=0 "$stage/servers/fixture.conf"
+check activate true
+check grep -Fxq enabled=1 "$stage/servers/fixture.conf"
+for action in enable is-enabled start; do
+  : > "$stage/calls"
+  if FAIL_ACTION=$action activate true; then echo "Accepted failed $action" >&2; exit 1; fi
+  check grep -q '^ERROR' "$stage/err"
+  check test ! -s "$stage/out"
+  if [[ $action != start ]]; then
+    check test "$(grep -c '^start ' "$stage/calls" || true)" = 0
+  fi
+done
+for state in enabled-runtime linked disabled; do
+  if ENABLE_STATE=$state activate true; then echo 'Accepted nonpersistent activation' >&2; exit 1; fi
+  check grep -q '^ERROR' "$stage/err"
+done
+if FAIL_ACTION=disable activate false; then exit 1; fi
+check grep -q '^ERROR' "$stage/err"
+if FAIL_ACTION=stop activate false; then exit 1; fi
+check grep -q '^ERROR' "$stage/err"
+for action in daemon-reload restart; do
+  if FAIL_ACTION=$action save; then exit 1; fi
+  check grep -q '^ERROR' "$stage/err"
+done
+check activate true
+check flock -n "$stage/operation.lock" true
+printf 'OK: %s admin autostart checks; real activation branch, no live services or mounts\n' "$checks"

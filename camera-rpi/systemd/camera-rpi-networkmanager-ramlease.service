@@ -1,0 +1,15 @@
+[Unit]
+Description=NetworkManager DHCP-Leases im RAM halten
+Documentation=file:/usr/local/share/doc/camera-rpi/LOW-WRITE.md
+RequiresMountsFor=/var/lib/NetworkManager
+After=local-fs.target
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/camera-rpi-networkmanager-ramlease setup
+ExecStop=/usr/local/libexec/camera-rpi-networkmanager-ramlease teardown
+RemainAfterExit=yes
+
+[Install]
+WantedBy=NetworkManager.service

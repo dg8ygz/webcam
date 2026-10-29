@@ -1,0 +1,18 @@
+[Unit]
+Description=Camera-RPi GPIO allocation for this boot
+After=local-fs.target systemd-udev-trigger.service
+Before=camera-rpi-sensor.service camera-rpi-climate.service camera-rpi-camera-power.service
+ConditionPathExists=/etc/camera-rpi/gpio.json
+
+[Service]
+Type=oneshot
+RuntimeDirectory=camera-rpi-gpio
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/php /usr/local/libexec/camera-rpi-gpio.php boot
+RemainAfterExit=yes
+TimeoutStartSec=30s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

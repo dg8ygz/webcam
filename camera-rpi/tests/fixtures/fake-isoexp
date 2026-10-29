@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# No GPIO/USB: record arguments and model camera failure/timeout for the worker.
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_ISOEXP_LOG"
+if [[ "${FAKE_ISOEXP_HANG:-0}" == 1 ]]; then exec sleep 60; fi
+if [[ "${FAKE_ISOEXP_FAIL:-0}" == 1 ]]; then echo 'simulated PTP error' >&2; exit 8; fi
+printf 'Label: ISO Speed\nCurrent: 100\nEND\nLabel: Exposure Compensation\nCurrent: 2\nEND\n'

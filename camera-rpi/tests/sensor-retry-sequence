@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Exercise the real sample_once with controlled read outcomes and a fake clock.
+set -euo pipefail
+umask 077
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d)"
+trap 'rm -rf -- "$STAGE"' EXIT
+# Load functions only, without the config loader or live sampling loop.
+source <(sed '/^load_config$/,$d' "$PROJECT_DIR/scripts/camera-rpi-sensor")
+ENABLED=1
+TEMPERATURE_FILE=temperature
+HUMIDITY_FILE=humidity
+TEMPERATURE_SCALE=1000
+HUMIDITY_SCALE=1000
+HEATER_STATE_FILE=''
+FAN_PERCENT_FILE=''
+FAN_RPM_FILE=''
+FAN_RUNNING_FILE=''
+STATUS_GROUP=''
+STATUS_ROOT="$STAGE/status"
+HISTORY_HOURS=24
+mkdir "$STATUS_ROOT"
+
+sleep() { printf 'pause %s\n' "$1" >> "$STAGE/events"; }
+read_one_line() {
+  printf 'read %s\n' "$1" >> "$STAGE/events"
+  local number
+  number="$(grep -c '^read temperature$' "$STAGE/events")"
+  case "$SCENARIO:$1:$number" in
+    happy:temperature:*) printf '21400\n' ;;
+    happy:humidity:*) printf '53600\n' ;;
+    retry:temperature:1) return 1 ;;
+    retry:temperature:*) printf '21400\n' ;;
+    retry:humidity:2) return 1 ;;
+    retry:humidity:3) printf '53600\n' ;;
+    invalid:temperature:1) printf 'invalid\n' ;;
+    invalid:temperature:2) printf '21400\n' ;;
+    invalid:humidity:2) printf 'invalid\n' ;;
+    invalid:temperature:3) printf '21400\n'; return 1 ;;
+    invalid:temperature:4) printf '21400\n'; return 1 ;;
+    *) printf 'Unexpected read: %s:%s:%s\n' "$SCENARIO" "$1" "$number" >&2; return 1 ;;
+  esac
+}
+SCENARIO=happy
+: > "$STAGE/events"
+sample_once
+diff -u <(printf '%s\n' 'read temperature' 'read humidity') "$STAGE/events"
+grep -qx 'sensor_state=ok' "$STATUS_ROOT/current.status"
+grep -qx 'ok_first=1' "$STATUS_ROOT/sensor-read-counters.status"
+
+SCENARIO=retry
+: > "$STAGE/events"
+sample_once
+diff -u <(printf '%s\n' \
+  'read temperature' 'pause 3' 'read temperature' 'read humidity' \
+  'pause 3' 'read temperature' 'read humidity') "$STAGE/events"
+grep -qx 'sensor_state=ok' "$STATUS_ROOT/current.status"
+grep -qx 'temperature_c=21.4' "$STATUS_ROOT/current.status"
+grep -qx 'humidity_percent=53.6' "$STATUS_ROOT/current.status"
+grep -qx 'ok_third=1' "$STATUS_ROOT/sensor-read-counters.status"
+grep -qx 'attempts=4' "$STATUS_ROOT/sensor-read-counters.status"
+
+SCENARIO=invalid
+: > "$STAGE/events"
+sample_once
+diff -u <(printf '%s\n' \
+  'read temperature' 'pause 3' 'read temperature' 'read humidity' \
+  'pause 3' 'read temperature' 'pause 3' 'read temperature') "$STAGE/events"
+grep -qx 'sensor_state=error' "$STATUS_ROOT/current.status"
+grep -qx 'temperature_c=' "$STATUS_ROOT/current.status"
+grep -qx 'humidity_percent=' "$STATUS_ROOT/current.status"
+test "$(wc -l < "$STATUS_ROOT/history.tsv")" -eq 2
+grep -qx 'failed_cycles=1' "$STATUS_ROOT/sensor-read-counters.status"
+grep -qx 'attempts=8' "$STATUS_ROOT/sensor-read-counters.status"
+grep -qx 'temperature_errors=4' "$STATUS_ROOT/sensor-read-counters.status"
+grep -qx 'humidity_errors=2' "$STATUS_ROOT/sensor-read-counters.status"
+printf 'OK: Paired reads, 3s retry gaps, maximum four attempts, no partial measurements\n'

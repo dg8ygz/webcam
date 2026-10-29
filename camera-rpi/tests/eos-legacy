@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Isolated capture protocol/lifecycle and missing-old-image regressions.
+# No real USB, network, GPIO, mount changes, secrets or service operations.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-eos-test.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source "$PROJECT/ops/test-legacy-capture.sh"
+source "$PROJECT/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_GPHOTO_BIN="$PROJECT/tests/fixtures/fake-eos-gphoto"
+export EOS_TEST_LOG="$STAGE/sequence.log"
+export CAMERA_RPI_CLIMATE_CONFIG="$STAGE/no-climate.json"
+# This test checks the EOS download directory itself. A host privacy policy
+# would wrap it in a different staging directory and read live configuration.
+export CAMERA_RPI_PRIVACY_CONFIG="$STAGE/no-privacy.json"
+export CAMERA_RPI_PRIVACY_HELPER="$STAGE/no-privacy.php"
+export CAMERA_RPI_PRIVACY_RUNTIME="$STAGE/privacy"
+CAPTURE_BACKEND=gphoto2
+GPHOTO_CAPTURE_MODE=eos-legacy
+GPHOTO_TIMEOUT_SECONDS=10
+MAX_IMAGE_BYTES=2048
+CAMERA_RPI_EOS_HELPER="$PROJECT/scripts/lib/camera-rpi-eos-legacy"
+chmod 0755 "$CAMERA_RPI_GPHOTO_BIN" "$CAMERA_RPI_EOS_HELPER"
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+capture() { cr_capture_to_file "$STAGE/$1.jpg" > "$STAGE/$1.log" 2>&1; }
+# The real successful standalone test ran in writable /tmp; the systemd worker
+# inherits /. /proc cannot accept regular files, even when tests run as root.
+# An absolute *.jpg.part target must still get a writable download CWD.
+export EOS_TEST_CWD_LOG="$STAGE/cwd.log"
+(cd /proc && cr_capture_to_file "$STAGE/readonly-parent.jpg.part") > "$STAGE/cwd-capture.log" 2>&1 \
+  || { cat "$STAGE/cwd-capture.log"; printf 'FAIL: Aufnahme aus nicht beschreibbarem CWD\n' >&2; exit 1; }
+expect test -s "$STAGE/readonly-parent.jpg.part"
+expect test "$(tail -n 1 "$EOS_TEST_CWD_LOG")" = "$STAGE"
+: > "$EOS_TEST_LOG"
+capture ok || { cat "$STAGE/ok.log"; exit 1; }
+expect test -s "$STAGE/ok.jpg"
+expect grep -Fq -- '--set-config-value eosremoterelease=Release Half --wait-event=5s --set-config-value eosremoterelease=Immediate --set-config-value eosremoterelease=Release Full --capture-tethered=80s' "$EOS_TEST_LOG"
+expect test "$(tail -n 1 "$EOS_TEST_LOG")" = '--set-config-value eosremoterelease=Release Full'
+expect test "$(wc -l < "$EOS_TEST_LOG")" -eq 2
+expect test "$(stat -c %a "$STAGE/ok.jpg")" = 600
+for fault in press-fail inline-release-fail fail no-file killed raw oversized release-fail hang; do
+  : > "$EOS_TEST_LOG"
+  if (export EOS_TEST_CASE="$fault"; GPHOTO_TIMEOUT_SECONDS=3; capture "$fault"); then
+    printf 'FAIL: Fehler als Erfolg: %s\n' "$fault" >&2; exit 1
+  fi
+  ((checks+=1))
+  expect test "$(tail -n 1 "$EOS_TEST_LOG")" = '--set-config-value eosremoterelease=Release Full'
+done
+# A repeat must not overwrite a local image; no camera command in that case.
+before="$(sha256sum "$STAGE/ok.jpg")"
+: > "$EOS_TEST_LOG"
+if capture ok; then exit 1; fi
+expect test "$before" = "$(sha256sum "$STAGE/ok.jpg")"
+expect test ! -s "$EOS_TEST_LOG"
+expect test -z "$(find "$STAGE" -name '.eos-download.*' -print)"
+# Hook standalone/injected parent must not signal anybody.
+if ACTION=download ARGUMENT="$STAGE/ok.jpg" CAMERA_RPI_EOS_TARGET="$STAGE/ok.jpg" \
+  CAMERA_RPI_EOS_PID=999999999 "$CAMERA_RPI_EOS_HELPER"; then exit 1; fi
+((checks+=1))
+mkdir "$STAGE/missing" "$STAGE/existing"
+lc_snapshot_old_image "$STAGE/old.jpg" "$STAGE/missing"
+expect lc_verify_old_image "$STAGE/old.jpg" "$STAGE/missing"
+cp "$STAGE/ok.jpg" "$STAGE/old.jpg"
+if lc_verify_old_image "$STAGE/old.jpg" "$STAGE/missing"; then exit 1; fi
+((checks+=1))
+lc_snapshot_old_image "$STAGE/old.jpg" "$STAGE/existing"
+expect lc_verify_old_image "$STAGE/old.jpg" "$STAGE/existing"
+printf x >> "$STAGE/old.jpg"
+if lc_verify_old_image "$STAGE/old.jpg" "$STAGE/existing" >/dev/null 2>&1; then exit 1; fi
+((checks+=1))
+printf 'OK: %s EOS-Legacy-Pruefungen (Sequenz/Hook/Timeout/Release/JPEG/Altbild); keine Hardware\n' "$checks"

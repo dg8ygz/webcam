@@ -1,0 +1,10 @@
+/* Scoped component: use the original webcam theme, header and page width. */
+.camera-live .live-image.is-usb-live { display: block; padding: 0; min-height: 0; }
+.usb-live-player { width: 100%; color: var(--adaptive-text); background: var(--adaptive-panel); }
+.usb-live-player__controls { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem; padding: .8rem 1rem 0; }
+.usb-live-player__controls span { margin-right: auto; }
+.usb-live-player button { padding: .45rem .8rem; cursor: pointer; }
+.usb-live-player button:disabled { cursor: default; opacity: .6; }
+.usb-live-player a { color: var(--color-accent); }
+.usb-live-player [data-usb-state] { margin: .65rem 1rem; min-height: 1.5em; }
+.usb-live-player video { display: block; width: 100%; aspect-ratio: 16/9; max-height: 75vh; object-fit: contain; background: #000; }

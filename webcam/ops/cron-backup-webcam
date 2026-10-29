@@ -1,0 +1,3 @@
+# DISABLED: Duplicate of ops/cron-backup-camera-db (03:10). Keep only one daily run to avoid doppelte Backups.
+# Backup Webcams (Config + per-Camera DBs) – formerly 03:30
+#30 3 * * * www-data php /var/www/html/webcam/bin/backup_daily.php >> /var/www/html/webcam/var/log/backup_daily.log 2>&1

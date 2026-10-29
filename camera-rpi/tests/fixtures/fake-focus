@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Every invocation must hold the SAME lock used by camera captures.
+if flock -n "$CAMERA_RPI_OPERATION_LOCK" true; then exit 98; fi
+# Queries describe the .16 properties without accessing hardware. Keep a full
+# optional trace separate from the movement log used by replay tests.
+[[ -z "${FAKE_FOCUS_TRACE:-}" ]] || printf '%s\n' "$*" >> "$FAKE_FOCUS_TRACE"
+interface="${FAKE_FOCUS_INTERFACE:-output}"
+if [[ "$1" == --list-config ]]; then
+  [[ "${FAKE_FOCUS_QUERY_EXIT:-0}" == 0 ]] || exit "$FAKE_FOCUS_QUERY_EXIT"
+  printf '/main/actions/manualfocusdrive\n/main/actions/autofocusdrive\n'
+  case "$interface" in
+    output) printf '/main/settings/output\n/main/settings/evfmode\n/main/actions/viewfinder\n' ;;
+    viewfinder|eosviewfinder) printf '/main/actions/%s\n' "$interface" ;;
+  esac
+  exit 0
+fi
+if [[ "$1" == --get-config ]]; then
+  [[ "${FAKE_FOCUS_QUERY_EXIT:-0}" == 0 ]] || exit "$FAKE_FOCUS_QUERY_EXIT"
+  printf 'Readonly: %s\n' "${FAKE_FOCUS_READONLY:-0}"
+  case "$2" in
+    manualfocusdrive)
+      printf 'Type: RADIO\nCurrent: None\n'
+      # Deliberately shifted indices prove that the implementation uses values.
+      [[ "${FAKE_FOCUS_MISSING_CHOICE:-0}" == 1 ]] || printf 'Choice: 10 Near 1\nChoice: 11 Near 2\nChoice: 14 Far 1\nChoice: 15 Far 2\n'
+      ;;
+    autofocusdrive|viewfinder|eosviewfinder) printf 'Type: TOGGLE\nCurrent: 0\n' ;;
+    output)
+      printf 'Type: RADIO\nCurrent: Off\nChoice: 1 PC\n'
+      [[ "${FAKE_FOCUS_MISSING_OFF:-0}" == 1 ]] || printf 'Choice: 11 Off\n'
+      ;;
+    evfmode) printf 'Type: RADIO\nCurrent: 1\nChoice: 0 1\nChoice: 1 0\n' ;;
+    *) exit 97 ;;
+  esac
+  printf 'END\n'
+  exit 0
+fi
+case "$*" in
+  '--set-config-value output=Off'|'--set-config viewfinder=0'|'--set-config eosviewfinder=0')
+    exit "${FAKE_FOCUS_CLEANUP_EXIT:-0}" ;;
+esac
+printf '%s\n' "$*" >> "$FAKE_FOCUS_LOG"
+[[ "${FAKE_FOCUS_HANG:-0}" != 1 ]] || sleep 60
+exit "${FAKE_FOCUS_EXIT:-0}"

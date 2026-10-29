@@ -1,0 +1,14 @@
+[Definition]
+
+# Zaehlt ausschliesslich abgeschlossene POST-Anfragen an den klassischen
+# Komplettupload. Der Ausdruck deckt PROD, DEV, den testx-Alias und den alten
+# direkten /include-Weg ab. Der HTTP-Status ist absichtlich beliebig: Auch
+# abgewiesene Schluessel-, Groessen- oder Protokollversuche verbrauchen ein
+# Rate-Budget und duerfen nicht kostenlos wiederholt werden.
+# Fail2Ban erkennt und entfernt den Apache-Zeitstempel vor dem eigentlichen
+# Regex-Abgleich. Der flexible Mittelteil beginnt deshalb direkt hinter dem
+# ersten Bindestrich und nimmt Benutzerfeld sowie den entfernten Zeitstempel
+# auf. Ein fest eingetragener Zeitstempel wuerde reale Logzeilen verfehlen.
+failregex = ^<HOST> - .* "POST /(?:(?:webcam|webcam2|testx)/)?include/upload\.php(?:\?[^ ]*)? HTTP/[0-9.]+" [0-9]{3} (?:[0-9]+|-)(?: .*)?$
+
+ignoreregex =

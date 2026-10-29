@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily camera system maintenance at 03:05
+
+[Timer]
+OnCalendar=*-*-* 03:05:00 Europe/Berlin
+AccuracySec=15s
+Persistent=false
+Unit=camera-rpi-system-maintenance.service
+
+[Install]
+WantedBy=timers.target

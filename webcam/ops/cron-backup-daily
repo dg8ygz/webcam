@@ -1,0 +1,3 @@
+MAILTO=
+# LEGACY/DISABLED: Backup laeuft intern ueber Kamera-Poll + Admin > Scripte.
+#17 3 * * * www-data cd /var/www/html/webcam && ./bin/backup_daily.php >> /var/www/html/webcam/var/log/backup_daily.log 2>&1

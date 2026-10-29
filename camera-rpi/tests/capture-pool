@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Real worker/queue/upload integration; fake camera and HTTP only. No services,
+# GPIO, network or root remounts. Concurrent clients must share one JPEG inode.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /dev/shm/camera-rpi-pool.XXXXXXXX)"
+cleanup() {
+  local result=$?
+  if (( result != 0 )); then
+    for log in "$STAGE/one.log" "$STAGE/two.log"; do
+      [[ ! -f "$log" ]] || tail -n 15 "$log" >&2
+    done
+  fi
+  rm -rf -- "$STAGE"
+}
+trap cleanup EXIT
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+mkdir -p "$STAGE/etc/servers" "$STAGE/keys" "$STAGE/run" "$STAGE/spool" "$STAGE/status"
+export CAMERA_RPI_COMMON_LIB="$PROJECT/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_SOURCE_CONFIG="$STAGE/etc/no-host-source.conf"
+export CAMERA_RPI_PRIVACY_HELPER="$STAGE/no-host-privacy.php"
+export CAMERA_RPI_PRIVACY_CONFIG="$STAGE/no-host-privacy.json"
+export CAMERA_RPI_TUNNEL_HELPER="$STAGE/no-host-tunnel.py"
+export CAMERA_RPI_POOL_CONFIG="$STAGE/etc/capture-pool.conf"
+export CAMERA_RPI_OPERATION_LOCK="$STAGE/operation.lock"
+export CAMERA_RPI_CURL_BIN="$PROJECT/tests/fixtures/fake-curl"
+export CAMERA_RPI_GPHOTO_BIN="$PROJECT/tests/fixtures/fake-gphoto2"
+# Pool tests mock the physical backend, including the EOS default. The real
+# EOS shutter/hook sequence is covered separately by tests/eos-legacy.
+export CAMERA_RPI_EOS_HELPER="$STAGE/fake-eos"
+cat > "$CAMERA_RPI_EOS_HELPER" <<'EOS'
+#!/usr/bin/env bash
+set -eu
+[[ "$1" == --capture ]]
+exec "$CAMERA_RPI_GPHOTO_BIN" --filename "$2"
+EOS
+chmod 0700 "$CAMERA_RPI_EOS_HELPER"
+export CAMERA_RPI_CLIMATE_CONFIG="$STAGE/no-climate"
+export CAMERA_RPI_STATUS_ROOT="$STAGE/status" CAMERA_RPI_STATUS_GROUP=''
+export CAMERA_RPI_WEATHER_HELPER="$PROJECT/scripts/lib/camera-rpi-weather.py"
+export CAMERA_RPI_ALLOW_NONROOT_CONFIG=1
+export CAMERA_RPI_POWER_HELPER="$STAGE/fake-power.php" FAKE_RECOVERY_LOG="$STAGE/recovery.log"
+cat > "$CAMERA_RPI_POWER_HELPER" <<'PHP'
+<?php
+file_put_contents(getenv('FAKE_RECOVERY_LOG'),$argv[1]."\n",FILE_APPEND);
+PHP
+if [[ ${SOURCE_TEST_RTSP:-0} == 1 ]]; then
+  export CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_SOURCE_CONFIG="$STAGE/source.conf"
+  export CAMERA_RPI_FFMPEG_BIN="$PROJECT/tests/fixtures/fake-rtsp-ffmpeg"
+  cp "$PROJECT/config/camera-source.example.conf" "$CAMERA_RPI_SOURCE_CONFIG"
+  chmod 600 "$CAMERA_RPI_SOURCE_CONFIG"
+fi
+export FAKE_GPHOTO_LOG="$STAGE/camera.log" FAKE_CAMERA_ACTIVE="$STAGE/camera-active"
+export FAKE_CAMERA_OVERLAP_LOG="$STAGE/overlap.log"
+export FAKE_CURL_ARGUMENT_LOG="$STAGE/curl.log" FAKE_UPLOAD_LOG="$STAGE/upload.log"
+export FAKE_CURL_CONFIG_LOG="$STAGE/forms.log"
+export FAKE_CAPTURE_SERIAL="$(( $(date +%s) / 600 * 600 ))"
+serial="$FAKE_CAPTURE_SERIAL"
+printf 'source_server=server-one\n' > "$CAMERA_RPI_POOL_CONFIG"
+if [[ ${POOL_TEST_TIMEZONE:-0} == 1 ]]; then
+  export TZ=Europe/London
+  printf 'legacy_timezone=Europe/Berlin\n' >> "$CAMERA_RPI_POOL_CONFIG"
+fi
+for pair in one:111111 two:222222 three:333333; do
+  name="${pair%:*}" secret="${pair#*:}"
+  printf 'key-%s-%s\n' "$name" "$secret" > "$STAGE/keys/server-$name.key"
+  {
+    printf 'server_id=server-%s\nserver_base_url=http://server-%s.invalid/webcam\ncamera_slug=bielefeld\n' "$name" "$name"
+    printf 'key_file=%s/keys/server-%s.key\n' "$STAGE" "$name"
+    printf 'spool_root=%s/spool\nruntime_root=%s/run\nmanage_root_mount=false\n' "$STAGE" "$STAGE"
+    printf 'upload_mode=chunked\n'
+  } > "$STAGE/etc/servers/server-$name.conf"
+done
+printf 'sensor_state=ok\nupdated_epoch=%s\ntemperature_c=23.3\nhumidity_percent=61.5\n' "$(date +%s)" > "$STAGE/status/current.status"
+worker() { bash "$PROJECT/scripts/camera-rpi-worker" --once "$STAGE/etc/servers/server-$1.conf"; }
+# Two independently authenticated targets race for the same camera round;
+# retain both target files by rejecting HTTP confirmation.
+FAKE_FAIL_UPLOAD_HOST=server-one.invalid worker one > "$STAGE/one.log" 2>&1 & p1=$!
+FAKE_FAIL_UPLOAD_HOST=server-two.invalid worker two > "$STAGE/two.log" 2>&1 & p2=$!
+if wait "$p1"; then echo 'Expected rejected upload'; exit 1; fi
+if wait "$p2"; then echo 'Expected rejected upload'; exit 1; fi
+master="$STAGE/spool/.capture-pool/$serial/image.jpg"
+a="$STAGE/spool/server-one/images/$serial.jpg" b="$STAGE/spool/server-two/images/$serial.jpg"
+expect test -s "$master"
+if [[ ${POOL_TEST_TIMEZONE:-0} == 1 ]]; then
+  expect test "$(cat "$a.legacy-stamp")" = "$(TZ=Europe/Berlin date -d "@$serial" +%Y%m%d_%H%M)"
+fi
+expect test "$(stat -c %i "$master")" = "$(stat -c %i "$a")"
+expect test "$(stat -c %i "$a")" = "$(stat -c %i "$b")"
+expect test "$(stat -c %h "$master")" = 4
+expect test "$(grep -c 'start' "$FAKE_GPHOTO_LOG")" = 1
+expect test ! -s "$FAKE_CAMERA_OVERLAP_LOG"
+expect cmp "$a.weather.json" "$b.weather.json"
+expect test "$(stat -c %a "$master")" = 600
+preview_before="$(sha256sum "$STAGE/status/latest.status")"
+# Acknowledging one target cannot remove the other's pending bytes/master.
+FAKE_COMMAND_MODE=wait worker one >> "$STAGE/one.log" 2>&1
+expect test ! -e "$a"
+expect test -s "$b"
+expect test -s "$master"
+# A late third target already owns its queued image, without any capture poll.
+FAKE_COMMAND_MODE=wait worker three > "$STAGE/three.log" 2>&1
+# A delayed, dated Legacy scheduler request is the same already delivered
+# slot even though its request ID has newer seconds. Other targets may still
+# be waiting; their original pooled bytes must stay untouched.
+pool_stamp="$(cat "${master%/*}/stamp")"
+FAKE_COMMAND_MODE=legacy-current FAKE_CAPTURE_SERIAL="$((serial+39))" FAKE_LEGACY_STAMP="$pool_stamp" worker one > "$STAGE/late-legacy.log" 2>&1
+expect test "$(grep -c 'start' "$FAKE_GPHOTO_LOG")" = 1
+expect grep -q 'keine zweite Aufnahme' "$STAGE/late-legacy.log"
+expect test -s "$b"
+expect test "$(grep -c 'start' "$FAKE_GPHOTO_LOG")" = 1
+expect test "$preview_before" = "$(sha256sum "$STAGE/status/latest.status")"
+expect grep -q 'local_weather=.*23.3.*61.5' "$FAKE_CURL_CONFIG_LOG"
+# Chunked retry also uses those exact queued bytes without a new capture.
+FAKE_COMMAND_MODE=wait FAKE_CHUNK_SUPPORT_HOST=server-two.invalid worker two >> "$STAGE/two.log" 2>&1
+expect test ! -e "$b"
+expect grep -q 'chunked:' "$FAKE_UPLOAD_LOG"
+expect test ! -e "$master"
+# Fast client A creates subsequent generations while B/C fail/stay offline.
+# They retain all timestamps, without ever accessing the camera themselves.
+for n in $(seq 1 10); do
+  FAKE_CAPTURE_SERIAL="$((serial + n))" worker one >> "$STAGE/one.log" 2>&1
+done
+expect test "$(find "$STAGE/spool/server-two/images" -name '*.jpg' | wc -l)" = 10
+expect test "$(grep -c 'start' "$FAKE_GPHOTO_LOG")" = 11
+# Simulate a reader in flight on the oldest JPEG inode. Generation eleven
+# must NOT delete it; after closing the reader the next recovery trims it.
+old="$STAGE/spool/server-two/images/$((serial + 1)).jpg"
+exec {reader}<"$old"
+flock -s "$reader"
+FAKE_CAPTURE_SERIAL="$((serial + 11))" worker one >> "$STAGE/one.log" 2>&1
+expect test -s "$old"
+expect test "$(find "$STAGE/spool/server-two/images" -name '*.jpg' | wc -l)" = 11
+exec {reader}<&-
+source "$CAMERA_RPI_COMMON_LIB"
+source "$PROJECT/scripts/lib/camera-rpi-pool.sh"
+cr_load_server_config "$STAGE/etc/servers/server-two.conf"
+url="$UPLOAD_URL" key="$KEY_FILE"
+cr_pool_load
+FINDMNT_BIN=/usr/bin/findmnt FLOCK_BIN=/usr/bin/flock
+# Library integration uses real validators from the worker, but no main loop.
+source <(sed -n -e '/^valid_jpeg() {/,/^}/p' "$PROJECT/scripts/camera-rpi-worker")
+cr_pool_recover
+expect test ! -e "$old"
+expect test "$(find "$STAGE/spool/server-two/images" -name '*.jpg' | wc -l)" = 10
+expect test ! -e "$STAGE/spool/.capture-pool/$((serial + 1))"
+expect test -s "$STAGE/spool/server-two/images/$((serial + 2)).jpg.legacy-stamp"
+expect test "$url" = "$UPLOAD_URL"
+expect test "$key" = "$KEY_FILE"
+# A broken destination publication can be retried from the committed master;
+# no second camera operation is needed to repair a missing target hardlink.
+repair_serial="$((serial + 2))"
+rm "$STAGE/spool/server-two/images/$repair_serial.jpg"
+cr_pool_recover
+expect test "$STAGE/spool/server-two/images/$repair_serial.jpg" -ef "$STAGE/spool/.capture-pool/$repair_serial/image.jpg"
+# A process interruption midway through final-ACK cleanup must not wedge all
+# other clients. Empty obligations permit recovery even if the master is gone.
+cleanup_serial="$((serial + 3))"
+rm "$STAGE/spool/.capture-pool/$cleanup_serial/pending/server-two" "$STAGE/spool/.capture-pool/$cleanup_serial/pending/server-three"
+rm "$STAGE/spool/.capture-pool/$cleanup_serial/image.jpg"
+cr_pool_recover
+expect test ! -d "$STAGE/spool/.capture-pool/$cleanup_serial"
+# Drain old uploads before starting the 30-second cooldown assertion. On
+# slower hosts queue draining can itself take longer than the cooldown.
+for n in $(seq 1 12); do FAKE_COMMAND_MODE=wait worker three >> "$STAGE/three.log" 2>&1; done
+# A failed physical capture keeps the command, publishes no incomplete JPEG,
+# and can be retried once without affecting already queued generations.
+failed_serial="$((serial + 12))"
+if FAKE_GPHOTO_FAIL=1 FAKE_CAPTURE_SERIAL="$failed_serial" worker one > "$STAGE/failure.log" 2>&1; then exit 1; fi
+expect test -f "$STAGE/spool/server-one/requests/$failed_serial.request"
+expect test ! -e "$STAGE/spool/.capture-pool/$failed_serial/image.jpg"
+# A different worker must respect the same cooldown, without retaining the
+# operation lock or consuming its pending request. Test actual worker paths.
+FAKE_FAIL_UPLOAD_HOST=server-three.invalid FAKE_COMMAND_MODE=wait worker three > "$STAGE/three.log" 2>&1 || true
+if FAKE_GPHOTO_FAIL=1 FAKE_CAPTURE_SERIAL="$failed_serial" worker three >> "$STAGE/three.log" 2>&1; then exit 1; fi
+expect test "$(grep -c 'failure' "$FAKE_GPHOTO_LOG")" = 1
+if [[ ${SOURCE_TEST_RTSP:-0} != 1 ]]; then
+  expect test "$(grep -c '^capture_failed$' "$FAKE_RECOVERY_LOG")" = 1
+fi
+expect test -f "$STAGE/spool/server-three/requests/$failed_serial.request"
+expect flock -n "$CAMERA_RPI_OPERATION_LOCK" true
+if FAKE_COMMAND_MODE=wait worker one >> "$STAGE/one.log" 2>&1; then exit 1; fi
+expect test "$(grep -c 'failure' "$FAKE_GPHOTO_LOG")" = 1
+# Expire only the isolated fixture's monotonic deadline, preserving the retry
+# count; no production override or real 30/60/300-second sleeps are needed.
+printf '0 30\n' > "$STAGE/spool/.capture-pool/capture-backoff"
+if FAKE_GPHOTO_FAIL=1 FAKE_COMMAND_MODE=wait worker three >> "$STAGE/three.log" 2>&1; then exit 1; fi
+expect test "$(grep -c 'failure' "$FAKE_GPHOTO_LOG")" = 2
+expect grep -q ' 60$' "$STAGE/spool/.capture-pool/capture-backoff"
+printf '0 300\n' > "$STAGE/spool/.capture-pool/capture-backoff"
+if FAKE_GPHOTO_FAIL=1 FAKE_COMMAND_MODE=wait worker one >> "$STAGE/one.log" 2>&1; then exit 1; fi
+expect grep -q ' 300$' "$STAGE/spool/.capture-pool/capture-backoff"
+printf '0 300\n' > "$STAGE/spool/.capture-pool/capture-backoff"
+FAKE_COMMAND_MODE=wait worker one >> "$STAGE/one.log" 2>&1
+expect test ! -e "$STAGE/spool/.capture-pool/capture-backoff"
+if [[ ${SOURCE_TEST_RTSP:-0} != 1 ]]; then
+  expect test "$(grep -c '^capture_failed$' "$FAKE_RECOVERY_LOG")" = 3
+  expect test "$(grep -c '^capture_ok$' "$FAKE_RECOVERY_LOG")" = "$(grep -c 'start' "$FAKE_GPHOTO_LOG")"
+else
+  expect test ! -e "$FAKE_RECOVERY_LOG"
+fi
+expect test ! -f "$STAGE/spool/server-one/requests/$failed_serial.request"
+expect test -f "$STAGE/spool/server-two/images/$failed_serial.jpg"
+# Canon's known-good source profile wins even if the first client says standard.
+printf 'gphoto_capture_mode=eos-legacy\n' >> "$STAGE/etc/servers/server-one.conf"
+cr_pool_load
+expect test "$GPHOTO_CAPTURE_MODE" = eos-legacy
+expect test "$SERVER_ID" = server-two
+listing="$(printf 'action=list\n' | CAMERA_RPI_CONFIG_DIR="$STAGE/etc/servers" CAMERA_RPI_ADMIN_TEST_MODE=1 bash "$PROJECT/scripts/admin/camera-rpi-admin")"
+expect test "$(awk -F '\t' '$1=="server-two" { print $19 ":" $20 }' <<< "$listing")" = eos-legacy:server-one
+# Pre-update framed but undecodable generation must not pin every target.
+# Corrupt the shared inode, then exercise full worker iteration and recovery.
+printf '\377\330not-a-jpeg\377\331' > "$STAGE/spool/server-two/images/$failed_serial.jpg"
+# Pad to the configured framing minimum while keeping the end marker.
+{ printf '\377\330'; head -c 1020 /dev/zero; printf '\377\331'; } > "$STAGE/spool/server-two/images/$failed_serial.jpg"
+for n in $(seq 1 12); do FAKE_COMMAND_MODE=wait worker two >> "$STAGE/quarantine-two.log" 2>&1; done
+expect test -f "$STAGE/spool/server-two/quarantine/$failed_serial.jpg"
+expect test ! -f "$STAGE/spool/server-two/images/$failed_serial.jpg"
+FAKE_COMMAND_MODE=wait worker three > "$STAGE/quarantine-three.log" 2>&1
+expect test -f "$STAGE/spool/server-three/quarantine/$failed_serial.jpg"
+after_serial="$(date +%s)"
+FAKE_CAPTURE_SERIAL="$after_serial" worker one > "$STAGE/after-quarantine.log" 2>&1
+expect grep -q 'von Server bestaetigt' "$STAGE/after-quarantine.log"
+# Successful backend exit with only JPEG framing must never publish a generation.
+invalid_serial="$((after_serial+1))"
+if FAKE_IMAGE_INVALID=1 FAKE_CAPTURE_SERIAL="$invalid_serial" worker one > "$STAGE/invalid-capture.log" 2>&1; then exit 1; fi
+expect test ! -f "$STAGE/spool/.capture-pool/$invalid_serial/image.jpg"
+expect test -f "$STAGE/spool/server-one/requests/$invalid_serial.request"
+# A specific conflict must not look like an ACK. Generic409 remains retryable;
+# an exact response quarantines only this target, preserving the pooled source
+# for other recipients. Ordinary undated captures above remain possible.
+conflict_image="$STAGE/spool/server-three/images/$after_serial.jpg"
+expect test -s "$conflict_image"
+if FAKE_COMMAND_MODE=wait FAKE_CHUNK_SUPPORT_HOST=server-three.invalid FAKE_SLOT_CONFLICT=other worker three > "$STAGE/conflict.log" 2>&1; then exit 1; fi
+expect test -s "$conflict_image"
+FAKE_COMMAND_MODE=wait FAKE_CHUNK_SUPPORT_HOST=server-three.invalid FAKE_SLOT_CONFLICT=immutable_slot_conflict worker three >> "$STAGE/conflict.log" 2>&1
+expect test ! -e "$conflict_image"
+expect test -s "$STAGE/spool/server-three/quarantine/$after_serial.jpg"
+expect test -s "$STAGE/spool/server-two/images/$after_serial.jpg"
+expect grep -q 'Slotkonflikt.*kein Upload-ACK' "$STAGE/conflict.log"
+# Corrupt/missing policy and inconsistent storage must not silently fall back.
+printf 'unknown=value\n' >> "$CAMERA_RPI_POOL_CONFIG"
+if cr_pool_load >/dev/null 2>&1; then exit 1; fi
+expect test "$POOL_ENABLED" = 0
+printf 'OK: %s shared-pool checks; concurrent workers, fan-out, legacy/chunk ACK, retry, weather, 10-image bound/reader lock; no hardware\n' "$checks"

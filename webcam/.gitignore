@@ -1,0 +1,27 @@
+# Runtime and generated assets
+var/
+storage/
+current/
+cache/
+orgin/
+database/*.sqlite
+database/*.sqlite-wal
+database/*.sqlite-shm
+database/backups/
+.phpunit.result.cache
+
+# Node / Playwright artifacts
+node_modules/
+.npmhome/
+month-picker.png
+tmp-*.js
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.swo
+
+/test-results/
+/e2e-artifacts/

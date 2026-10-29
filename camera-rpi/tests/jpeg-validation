@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Exercise real GD content validation and unavailable-decoder classification.
+set -euo pipefail
+project="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+stage="$(mktemp -d "${TMPDIR:-/tmp}/camera-jpeg-validation.XXXXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
+helper="$project/scripts/lib/camera-source.php"
+check_exit() {
+  local expected="$1" rc=0
+  shift
+  "$@" > "$stage/output" 2>&1 || rc=$?
+  [[ "$rc" == "$expected" ]] || { cat "$stage/output" >&2; printf 'expected=%s actual=%s\n' "$expected" "$rc" >&2; exit 1; }
+}
+check_exit 0 php "$helper" validate-jpeg "$project/tests/fixtures/capture.jpg"
+{ printf '\377\330'; head -c 1020 /dev/zero; printf '\377\331'; } > "$stage/framed.jpg"
+check_exit 1 php "$helper" validate-jpeg "$stage/framed.jpg"
+check_exit 2 php "$helper" validate-jpeg "$stage/missing.jpg"
+check_exit 2 php -n "$helper" validate-jpeg "$project/tests/fixtures/capture.jpg"
+# An exception in the decoder is infrastructure failure, not corrupt content.
+# Disable the built-in decoder only in this subprocess; header parsing remains.
+printf '%s\n' '<?php function imagecreatefromjpeg($file) { throw new RuntimeException("decoder unavailable"); }' > "$stage/decoder.php"
+check_exit 2 php -d disable_functions=imagecreatefromjpeg -d "auto_prepend_file=$stage/decoder.php" "$helper" validate-jpeg "$project/tests/fixtures/capture.jpg"
+printf 'OK: five JPEG validator checks; real content, invalid framing, absent file/GD, decoder exception\n'

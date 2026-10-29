@@ -1,0 +1,12 @@
+[Unit]
+Description=Volatile system and Apache logs
+Before=systemd-tmpfiles-setup.service
+
+[Mount]
+What=tmpfs
+Where=/var/log
+Type=tmpfs
+Options=mode=0755,nosuid,nodev,noatime,size=64M
+
+[Install]
+WantedBy=local-fs.target

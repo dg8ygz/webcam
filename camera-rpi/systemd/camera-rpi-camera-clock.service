@@ -1,0 +1,24 @@
+[Unit]
+Description=Synchronize Canon camera clock from NTP-synchronized Pi
+After=network-online.target systemd-timesyncd.service
+Wants=network-online.target
+StartLimitIntervalSec=1d
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/camera-rpi-camera-clock.py
+TimeoutStartSec=5min
+Restart=on-failure
+RestartSec=15min
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/lock
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes

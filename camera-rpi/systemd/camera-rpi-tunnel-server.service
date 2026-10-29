@@ -1,0 +1,27 @@
+[Unit]
+Description=Authenticated camera maintenance relay (loopback only)
+After=network.target
+
+[Service]
+DynamicUser=yes
+LoadCredential=users.json:/etc/camera-rpi-tunnel-server/users.json
+LoadCredential=key:/etc/camera-rpi-tunnel-server/key
+ExecStart=/usr/local/bin/chisel server --host 127.0.0.1 --port 9086 --reverse --keyfile %d/key --authfile %d/users.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

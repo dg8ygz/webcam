@@ -1,0 +1,1 @@
+ALTER TABLE stream ADD COLUMN max_clients INTEGER;

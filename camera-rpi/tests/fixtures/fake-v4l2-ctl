@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_VIDEO_LOG"
+if [[ "$*" == *--get-fmt-video* ]]; then
+  if [[ "${FAKE_VIDEO_FORMAT:-ok}" == bad ]]; then
+    printf "Width/Height : 640/480\nPixel Format : 'YUYV'\n"
+  else
+    printf "Width/Height : 1920/1080\nPixel Format : 'MJPG'\n"
+  fi
+  exit 0
+fi
+[[ "$*" == *--stream-count=1* && "$*" == *--stream-skip=15* ]] || exit 3
+[[ "${FAKE_VIDEO_FAIL:-0}" == 0 ]] || exit "$FAKE_VIDEO_FAIL"
+[[ "${FAKE_VIDEO_HANG:-0}" == 0 ]] || sleep 10
+for argument in "$@"; do
+  case "$argument" in --stream-to=*) target="${argument#*=}" ;; esac
+done
+if [[ "${FAKE_VIDEO_INVALID:-0}" == 1 ]]; then
+  printf 'not a jpeg' > "$target"
+  exit 0
+fi
+"$(dirname "$0")/fake-gphoto2" --filename "$target"
+# Real decodable 1920x1080 JPEG, followed by UVC padding for the trim test.
+cp -- "$(dirname -- "${BASH_SOURCE[0]}")/capture-video.jpg" "$target"
+printf 'camera-padding' >> "$target"

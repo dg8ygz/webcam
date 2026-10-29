@@ -1,0 +1,35 @@
+[Unit]
+Description=Camera-RPi on-demand USB video (experimental)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/camera-rpi/video.json
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/php /usr/local/libexec/camera-rpi-video.php --check /etc/camera-rpi/video.json
+ExecStart=/usr/bin/php /usr/local/libexec/camera-rpi-video.php /etc/camera-rpi/video.json
+RuntimeDirectory=camera-rpi-video
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=8
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/camera-rpi-video /run/lock
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=384M
+TasksMax=64
+CPUQuota=300%
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

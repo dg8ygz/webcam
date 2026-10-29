@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# A real named process (copied sleep binary), not a stubbed pgrep result.
+# The guard must reject BEFORE accessing unset camera/GPIO configuration.
+set -euo pipefail
+project="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+stage="$(mktemp -d /tmp/camera-legacy-guard-test.XXXXXXXX)"
+pid=''
+cleanup() { [[ -z "$pid" ]] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }; rm -rf -- "$stage"; }
+trap cleanup EXIT
+source "$project/scripts/lib/camera-rpi-common.sh"
+for name in webcam_wait webcam_capture; do
+  cp /bin/sleep "$stage/$name"
+  "$stage/$name" 30 & pid=$!
+  sleep 0.1
+  if cr_capture_to_file "$stage/must-not-exist.jpg" > "$stage/output" 2>&1; then echo 'Guard did not block' >&2; exit 1; fi
+  grep -q 'keine parallele Kameraaufnahme' "$stage/output"
+  [[ ! -e "$stage/must-not-exist.jpg" ]]
+  kill "$pid"; wait "$pid" 2>/dev/null || true; pid=''
+done
+echo 'OK: legacy poller and capture process block new capture before GPIO/USB; no hardware'

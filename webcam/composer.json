@@ -1,0 +1,7 @@
+{
+  "name": "webcam/platform",
+  "require": {},
+  "require-dev": {
+    "phpunit/phpunit": "^11.5"
+  }
+}

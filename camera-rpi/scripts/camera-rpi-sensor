@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+
+# Liest den DHT22 und die optionalen Rueckmeldungen von Heizung und Luefter.
+#
+# Das Script steuert keine Heizung und keinen Luefter. Es beobachtet nur die
+# konfigurierten Kernel-/Statusdateien. Aktuelle Werte und der begrenzte Verlauf
+# landen unter /run im RAM, damit das read-only Root-Dateisystem nicht fuer jede
+# Messung geoeffnet werden muss.
+
+set -euo pipefail
+umask 027
+
+CONFIG_PATH="/etc/camera-rpi/device.conf"
+RUN_ONCE=0
+CHECK_ONLY=0
+STATUS_ROOT="${CAMERA_RPI_STATUS_ROOT:-/run/camera-rpi-status}"
+STATUS_GROUP="${CAMERA_RPI_STATUS_GROUP:-www-data}"
+# The camera worker owns this lock with priority.  The sensor only attempts a
+# non-blocking acquisition, so an active capture is never delayed by a DHT
+# read. Retry a busy lock after one second without touching IIO; waiting a
+# full sample interval after every skip can expire climate data after a photo.
+SENSOR_OPERATION_LOCK=""
+SENSOR_OPERATION_LOCK_FD=""
+SENSOR_LOCK_BUSY=0
+
+# Process-local counters: no loading stale state across restarts, no new sensor
+# access and no journal spam. Publication below is restricted to tmpfs.
+COUNTERS_STARTED_EPOCH="$(date +%s)"
+declare -A READ_COUNTERS=([cycles]=0 [attempts]=0 [ok_first]=0 [ok_second]=0
+  [ok_third]=0 [ok_fourth]=0 [failed_cycles]=0 [unavailable_cycles]=0 [disabled_cycles]=0
+  [invalid_values]=0 [temperature_errors]=0 [humidity_errors]=0)
+
+usage() {
+  cat <<'EOF'
+Aufruf: camera-rpi-sensor [--once|--check-config] [DEVICE.conf]
+
+  ohne Option       dauerhaft alle konfigurierten Sensoren abfragen
+  --once            genau eine Messung schreiben
+  --check-config    Konfiguration nur pruefen
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --once) RUN_ONCE=1 ;;
+    --check-config) CHECK_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) printf 'Unbekannte Option: %s\n' "$1" >&2; exit 2 ;;
+    *) CONFIG_PATH="$1" ;;
+  esac
+  shift
+done
+
+# Entfernt nur Rand-Whitespace aus einem Wert, keine Shell-Auswertung.
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# Explizite Wahrheitswerte in 0/1 ueberfuehren; unbekannte Angaben ablehnen.
+bool_value() {
+  case "${1,,}" in
+    1|true|yes|on) printf '1' ;;
+    0|false|no|off) printf '0' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Optionale absolute Lesepfade ohne Traversal oder Zeilenumbrueche validieren.
+safe_source_path() {
+  local path="$1"
+  [[ -z "$path" ]] && return 0
+  [[ "$path" == /* && "$path" != *$'\n'* && "$path" != *$'\r'* \
+      && "$path" != *'/../'* && "$path" != */.. ]]
+}
+
+# Sensorintervalle und Skalierung vor jedem Zugriff auf ganzzahlige Grenzen pruefen.
+number_in_range() {
+  local name="$1" value="$2" minimum="$3" maximum="$4"
+  [[ "$value" =~ ^[0-9]+$ ]] && (( value >= minimum && value <= maximum )) \
+    || { printf '%s muss zwischen %s und %s liegen.\n' "$name" "$minimum" "$maximum" >&2; return 1; }
+}
+
+# Strikte name=value-Konfiguration lesen, nie sourcen; Quellen und Skalen muessen
+# zusammenpassen. Validierung veraendert weder GPIO noch Heizungs-/Luefterzustand.
+load_config() {
+  local line key value parsed line_number=0
+  local config_mode config_uid
+  local -A seen=()
+
+  [[ -f "$CONFIG_PATH" && -r "$CONFIG_PATH" ]] \
+    || { printf 'Sensor-Konfiguration ist nicht lesbar: %s\n' "$CONFIG_PATH" >&2; return 1; }
+  if [[ "${CAMERA_RPI_SENSOR_TEST_MODE:-0}" != 1 ]]; then
+    config_mode="$(stat -c '%a' "$CONFIG_PATH" 2>/dev/null)" || return 1
+    config_uid="$(stat -c '%u' "$CONFIG_PATH" 2>/dev/null)" || return 1
+    [[ "$config_mode" =~ ^[0-7]{3,4}$ && "$config_uid" == 0 \
+        && $((8#$config_mode & 0022)) -eq 0 ]] \
+      || { printf 'Sensor-Konfiguration muss root gehoeren und darf nicht gruppen- oder weltbeschreibbar sein.\n' >&2; return 1; }
+  fi
+
+  ENABLED=0
+  SAMPLE_SECONDS=30
+  HISTORY_HOURS=24
+  DHT_IIO_DEVICE=auto
+  TEMPERATURE_FILE=""
+  HUMIDITY_FILE=""
+  TEMPERATURE_SCALE=1000
+  HUMIDITY_SCALE=1000
+  HEATER_STATE_FILE=""
+  HEATER_ACTIVE_VALUE=1
+  FAN_PERCENT_FILE=""
+  FAN_PERCENT_MAX=255
+  FAN_RPM_FILE=""
+  FAN_RUNNING_FILE=""
+  FAN_RUNNING_ACTIVE_VALUE=1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    line="${line%$'\r'}"
+    line="$(trim "$line")"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    [[ "$line" == *=* ]] \
+      || { printf 'Sensor-Konfigurationszeile %s enthaelt kein =.\n' "$line_number" >&2; return 1; }
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+    [[ "$key" =~ ^[a-z_]+$ && -z "${seen[$key]+x}" ]] \
+      || { printf 'Ungueltiger oder doppelter Wert in Zeile %s.\n' "$line_number" >&2; return 1; }
+    seen[$key]=1
+    case "$key" in
+      enabled) parsed="$(bool_value "$value")" || { printf 'enabled muss true oder false sein.\n' >&2; return 1; }; ENABLED="$parsed" ;;
+      sample_seconds) SAMPLE_SECONDS="$value" ;;
+      history_hours) HISTORY_HOURS="$value" ;;
+      dht_iio_device) DHT_IIO_DEVICE="$value" ;;
+      temperature_file) TEMPERATURE_FILE="$value" ;;
+      humidity_file) HUMIDITY_FILE="$value" ;;
+      temperature_scale) TEMPERATURE_SCALE="$value" ;;
+      humidity_scale) HUMIDITY_SCALE="$value" ;;
+      heater_state_file) HEATER_STATE_FILE="$value" ;;
+      heater_active_value) HEATER_ACTIVE_VALUE="$value" ;;
+      fan_percent_file) FAN_PERCENT_FILE="$value" ;;
+      fan_percent_max) FAN_PERCENT_MAX="$value" ;;
+      fan_rpm_file) FAN_RPM_FILE="$value" ;;
+      fan_running_file) FAN_RUNNING_FILE="$value" ;;
+      fan_running_active_value) FAN_RUNNING_ACTIVE_VALUE="$value" ;;
+      *) printf 'Unbekannter Sensor-Konfigurationswert: %s\n' "$key" >&2; return 1 ;;
+    esac
+  done < "$CONFIG_PATH"
+
+  number_in_range sample_seconds "$SAMPLE_SECONDS" 2 3600
+  number_in_range history_hours "$HISTORY_HOURS" 1 168
+  number_in_range temperature_scale "$TEMPERATURE_SCALE" 1 1000000
+  number_in_range humidity_scale "$HUMIDITY_SCALE" 1 1000000
+  number_in_range fan_percent_max "$FAN_PERCENT_MAX" 1 1000000
+  [[ "$HEATER_ACTIVE_VALUE" == 0 || "$HEATER_ACTIVE_VALUE" == 1 ]] \
+    || { printf 'heater_active_value muss 0 oder 1 sein.\n' >&2; return 1; }
+  [[ "$FAN_RUNNING_ACTIVE_VALUE" == 0 || "$FAN_RUNNING_ACTIVE_VALUE" == 1 ]] \
+    || { printf 'fan_running_active_value muss 0 oder 1 sein.\n' >&2; return 1; }
+  [[ "$DHT_IIO_DEVICE" == auto || "$DHT_IIO_DEVICE" =~ ^/sys/bus/iio/devices/iio:device[0-9]+$ ]] \
+    || { printf 'dht_iio_device muss auto oder ein IIO-Geraetepfad sein.\n' >&2; return 1; }
+  for path in "$TEMPERATURE_FILE" "$HUMIDITY_FILE" "$HEATER_STATE_FILE" \
+      "$FAN_PERCENT_FILE" "$FAN_RPM_FILE" "$FAN_RUNNING_FILE"; do
+    safe_source_path "$path" || { printf 'Ungueltiger absoluter Sensorpfad.\n' >&2; return 1; }
+  done
+  [[ ( -z "$TEMPERATURE_FILE" && -z "$HUMIDITY_FILE" ) \
+      || ( -n "$TEMPERATURE_FILE" && -n "$HUMIDITY_FILE" ) ]] \
+    || { printf 'temperature_file und humidity_file muessen gemeinsam gesetzt werden.\n' >&2; return 1; }
+}
+
+# RAM-Ausgabe fuer den Web-Leser freigeben, nicht die private Geraetekonfiguration.
+prepare_status_root() {
+  mkdir -p -- "$STATUS_ROOT"
+  chmod 0750 "$STATUS_ROOT" 2>/dev/null || true
+  if [[ -n "$STATUS_GROUP" ]] && getent group "$STATUS_GROUP" >/dev/null 2>&1; then
+    chgrp "$STATUS_GROUP" "$STATUS_ROOT" 2>/dev/null || true
+  fi
+}
+
+# Eine Sysfs-/Statuszeile lesen; EIO bleibt ein Fehler auch ohne gesetzten Wert.
+read_one_line() {
+  # An IIO read can fail with EIO before assigning any value. Keep the
+  # fallback below safe under nounset so callers can retry the measurement.
+  local path="$1" value=""
+  [[ -r "$path" ]] || return 1
+  IFS= read -r value < "$path" || [[ -n "$value" ]] || return 1
+  value="$(trim "${value%$'\r'}")"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  printf '%s' "$value"
+}
+
+# Explizite Dateien haben Vorrang, danach festes IIO-Geraet bzw. erster DHT-Treffer.
+# Nur Namen lesen, hier noch keine zusaetzliche Temperaturmessung ausloesen.
+resolve_dht_files() {
+  local device name
+  # Use only the boot-selected DHT, never a pending edit or enumeration order.
+  if [[ ${CAMERA_RPI_SENSOR_TEST_MODE:-0} != 1 && -e /etc/camera-rpi/gpio.json ]]; then
+    device="$(/usr/bin/php -d pcre.jit=0 -d opcache.enable_cli=0 /usr/local/libexec/camera-rpi-gpio.php sensor)" || return 1
+    [[ "$device" =~ ^/sys/bus/iio/devices/iio:device[0-9]+$ ]] || return 1
+    TEMPERATURE_FILE="$device/in_temp_input"
+    HUMIDITY_FILE="$device/in_humidityrelative_input"
+    return 0
+  fi
+  if [[ -n "$TEMPERATURE_FILE" ]]; then return 0; fi
+  if [[ "$DHT_IIO_DEVICE" != auto ]]; then
+    TEMPERATURE_FILE="$DHT_IIO_DEVICE/in_temp_input"
+    HUMIDITY_FILE="$DHT_IIO_DEVICE/in_humidityrelative_input"
+    return 0
+  fi
+  shopt -s nullglob
+  for device in /sys/bus/iio/devices/iio:device*; do
+    name="$(read_one_line "$device/name" 2>/dev/null || true)"
+    # Raspberry-Pi overlays commonly expose the node as `dht11@<gpio>`
+    # (for example `dht11@4`) instead of the bare driver name.
+    if [[ "$name" =~ ^dht11(@[^[:space:]]+)?$ \
+        && -r "$device/in_temp_input" \
+        && -r "$device/in_humidityrelative_input" ]]; then
+      TEMPERATURE_FILE="$device/in_temp_input"
+      HUMIDITY_FILE="$device/in_humidityrelative_input"
+      break
+    fi
+  done
+  shopt -u nullglob
+  [[ -n "$TEMPERATURE_FILE" ]]
+}
+
+# Ganzzahligen IIO-Rohwert auf eine Dezimalstelle umrechnen, inklusive Vorzeichen.
+scaled_tenths() {
+  local raw="$1" scale="$2" tenths sign whole fraction
+  [[ "$raw" =~ ^-?[0-9]+$ ]] || return 1
+  tenths=$((raw * 10 / scale))
+  sign=""
+  if (( tenths < 0 )); then sign='-'; tenths=$((-tenths)); fi
+  whole=$((tenths / 10))
+  fraction=$((tenths % 10))
+  printf '%s%s.%s' "$sign" "$whole" "$fraction"
+}
+
+# Vollstaendigen aktuellen Zustand atomar in RAM publizieren, auch bei Sensorfehlern.
+write_status() {
+  local temporary="$STATUS_ROOT/current.status.tmp.$$"
+  {
+    printf 'updated_epoch=%s\n' "$UPDATED_EPOCH"
+    printf 'sensor_state=%s\n' "$SENSOR_STATE"
+    printf 'sensor_message=%s\n' "$SENSOR_MESSAGE"
+    printf 'temperature_c=%s\n' "$TEMPERATURE_C"
+    printf 'humidity_percent=%s\n' "$HUMIDITY_PERCENT"
+    printf 'heater_state=%s\n' "$HEATER_STATE"
+    printf 'heater_message=%s\n' "$HEATER_MESSAGE"
+    printf 'fan_state=%s\n' "$FAN_STATE"
+    printf 'fan_percent=%s\n' "$FAN_PERCENT"
+    printf 'fan_rpm=%s\n' "$FAN_RPM"
+    printf 'fan_message=%s\n' "$FAN_MESSAGE"
+  } > "$temporary"
+  chmod 0640 "$temporary" 2>/dev/null || true
+  [[ -z "$STATUS_GROUP" ]] || chgrp "$STATUS_GROUP" "$temporary" 2>/dev/null || true
+  mv -f -- "$temporary" "$STATUS_ROOT/current.status"
+}
+
+# Nur der erfolgreiche Messpfad ruft dies auf: TSV anhaengen und Zeitfenster kuerzen.
+# SD-Sicherung bleibt Aufgabe des getrennten Tagesdienstes.
+append_history() {
+  local history="$STATUS_ROOT/history.tsv" temporary="$STATUS_ROOT/history.tsv.tmp.$$"
+  local cutoff=$((UPDATED_EPOCH - HISTORY_HOURS * 3600))
+  printf '%s\t%s\t%s\n' "$UPDATED_EPOCH" "$TEMPERATURE_C" "$HUMIDITY_PERCENT" >> "$history"
+  awk -F '\t' -v cutoff="$cutoff" '$1 ~ /^[0-9]+$/ && $1 >= cutoff' "$history" > "$temporary"
+  chmod 0640 "$temporary" 2>/dev/null || true
+  [[ -z "$STATUS_GROUP" ]] || chgrp "$STATUS_GROUP" "$temporary" 2>/dev/null || true
+  mv -f -- "$temporary" "$history"
+}
+
+# Maximal vier gepaarte DHT-Versuche mit Erholungsabstand; keine halben Werte
+# veroeffentlichen. Heizung/Luefter werden nur gelesen, niemals hier geschaltet.
+# A bounded snapshot replaces itself once per regular cycle. Failure to write
+# optional counters must never interrupt normal temperature/climate reporting.
+write_read_counters() {
+  local tmp="$STATUS_ROOT/sensor-read-counters.status.tmp.$$" key
+  if [[ ${CAMERA_RPI_SENSOR_TEST_MODE:-0} != 1 &&
+      "$(findmnt -n -o FSTYPE -T "$STATUS_ROOT" 2>/dev/null)" != tmpfs ]]; then return 0; fi
+  {
+    printf 'schema=sensor-read-counters-v1\nstarted_epoch=%s\npid=%s\nupdated_epoch=%s\nlast_attempt=%s\n' \
+      "$COUNTERS_STARTED_EPOCH" "$$" "$UPDATED_EPOCH" "$SENSOR_ATTEMPT"
+    for key in cycles attempts ok_first ok_second ok_third ok_fourth failed_cycles unavailable_cycles disabled_cycles invalid_values temperature_errors humidity_errors; do
+      printf '%s=%s\n' "$key" "${READ_COUNTERS[$key]}"
+    done
+  } > "$tmp" && mv -f -- "$tmp" "$STATUS_ROOT/sensor-read-counters.status"
+}
+
+sample_once() {
+  local raw_temp="" raw_humidity="" raw="" attempt
+  local temp_tenths humidity_tenths
+  SENSOR_ATTEMPT=0
+  SENSOR_LOCK_BUSY=0
+
+  # Camera/USB work has priority.  Do not wait behind a capture or hold the
+  # operation lock while the camera is trying to acquire it.  A skipped cycle
+  # leaves the last valid RAM snapshot untouched; the health age guard and the
+  # climate controller handle a genuinely stale sensor independently.
+  if [[ -n "$SENSOR_OPERATION_LOCK" ]]; then
+    exec {SENSOR_OPERATION_LOCK_FD}>"$SENSOR_OPERATION_LOCK" || return 0
+    if /usr/bin/flock -n "$SENSOR_OPERATION_LOCK_FD"; then
+      :
+    else
+      local lock_result=$?
+      exec {SENSOR_OPERATION_LOCK_FD}>&-
+      SENSOR_OPERATION_LOCK_FD=""
+      # Exit 1 means contention. Other lock errors keep the normal delay;
+      # neither path may publish fresh timestamps or perform sensor reads.
+      if (( lock_result == 1 )); then SENSOR_LOCK_BUSY=1; fi
+      return 0
+    fi
+  fi
+  # Lock probes are not measurement cycles and must not inflate read counters.
+  (( READ_COUNTERS[cycles] += 1 ))
+
+  UPDATED_EPOCH="$(date +%s)"
+  SENSOR_STATE=unavailable
+  SENSOR_MESSAGE='DHT22 ist noch nicht erreichbar.'
+  TEMPERATURE_C=""
+  HUMIDITY_PERCENT=""
+  HEATER_STATE=unknown
+  HEATER_MESSAGE='Heizungsstatus ist nicht angeschlossen.'
+  FAN_STATE=unknown
+  FAN_PERCENT=""
+  FAN_RPM=""
+  FAN_MESSAGE='Luefterstatus ist nicht angeschlossen.'
+
+  if (( ENABLED == 0 )); then
+    (( READ_COUNTERS[disabled_cycles] += 1 ))
+    SENSOR_STATE=disabled
+    SENSOR_MESSAGE='Sensorabfrage ist in device.conf noch deaktiviert.'
+  elif resolve_dht_files; then
+    for attempt in 1 2 3 4; do
+      SENSOR_ATTEMPT=$attempt
+      (( READ_COUNTERS[attempts] += 1 ))
+      # A failed IIO read may have triggered a real sensor transaction.
+      # Leave time for recovery (and expiry of the driver's 2s cache).
+      (( attempt == 1 )) || sleep 3
+      raw_temp=''
+      raw_humidity=''
+      if raw_temp="$(read_one_line "$TEMPERATURE_FILE" 2>/dev/null)" \
+          && [[ "$raw_temp" =~ ^-?[0-9]+$ ]]; then
+        # Only a successful temperature read lets us use the paired humidity
+        # from the driver cache; never immediately retry via the other file.
+        if raw_humidity="$(read_one_line "$HUMIDITY_FILE" 2>/dev/null)" \
+            && [[ "$raw_humidity" =~ ^[0-9]+$ ]]; then
+          break
+        fi
+        (( READ_COUNTERS[humidity_errors] += 1 ))
+      else
+        (( READ_COUNTERS[temperature_errors] += 1 ))
+      fi
+      # Do not publish partial output returned by an unsuccessful reader.
+      raw_temp=''
+      raw_humidity=''
+    done
+    if [[ "$raw_temp" =~ ^-?[0-9]+$ && "$raw_humidity" =~ ^[0-9]+$ ]]; then
+      TEMPERATURE_C="$(scaled_tenths "$raw_temp" "$TEMPERATURE_SCALE")"
+      HUMIDITY_PERCENT="$(scaled_tenths "$raw_humidity" "$HUMIDITY_SCALE")"
+      temp_tenths=$((raw_temp * 10 / TEMPERATURE_SCALE))
+      humidity_tenths=$((raw_humidity * 10 / HUMIDITY_SCALE))
+      if (( temp_tenths >= -400 && temp_tenths <= 800 \
+          && humidity_tenths >= 0 && humidity_tenths <= 1000 )); then
+        SENSOR_STATE=ok
+        case "$SENSOR_ATTEMPT" in
+          1) (( READ_COUNTERS[ok_first] += 1 )) ;;
+          2) (( READ_COUNTERS[ok_second] += 1 )) ;;
+          3) (( READ_COUNTERS[ok_third] += 1 )) ;;
+          4) (( READ_COUNTERS[ok_fourth] += 1 )) ;;
+        esac
+        SENSOR_MESSAGE='DHT22 liefert plausible Messwerte.'
+      else
+        (( READ_COUNTERS[invalid_values] += 1 ))
+        SENSOR_STATE=error
+        SENSOR_MESSAGE='DHT22 lieferte Werte ausserhalb des plausiblen Bereichs.'
+        TEMPERATURE_C=""
+        HUMIDITY_PERCENT=""
+      fi
+    else
+      (( READ_COUNTERS[failed_cycles] += 1 ))
+      SENSOR_STATE=error
+      SENSOR_MESSAGE='DHT22 konnte nach vier Versuchen nicht gelesen werden.'
+    fi
+  else
+    (( READ_COUNTERS[unavailable_cycles] += 1 ))
+  fi
+
+  if [[ -n "$HEATER_STATE_FILE" ]]; then
+    raw="$(read_one_line "$HEATER_STATE_FILE" 2>/dev/null || true)"
+    if [[ "$raw" == "$HEATER_ACTIVE_VALUE" ]]; then
+      HEATER_STATE=on; HEATER_MESSAGE='Heizung ist eingeschaltet.'
+    elif [[ "$raw" == 0 || "$raw" == 1 ]]; then
+      HEATER_STATE=off; HEATER_MESSAGE='Heizung ist ausgeschaltet.'
+    else
+      HEATER_STATE=error; HEATER_MESSAGE='Heizungsrueckmeldung ist nicht lesbar.'
+    fi
+  fi
+
+  if [[ -n "$FAN_PERCENT_FILE" ]]; then
+    raw="$(read_one_line "$FAN_PERCENT_FILE" 2>/dev/null || true)"
+    if [[ "$raw" =~ ^[0-9]+$ && raw -le FAN_PERCENT_MAX ]]; then
+      FAN_PERCENT=$(((raw * 100 + FAN_PERCENT_MAX / 2) / FAN_PERCENT_MAX))
+    fi
+  fi
+  if [[ -n "$FAN_RPM_FILE" ]]; then
+    raw="$(read_one_line "$FAN_RPM_FILE" 2>/dev/null || true)"
+    if [[ "$raw" =~ ^[0-9]+$ && raw -le 100000 ]]; then
+      FAN_RPM="$raw"
+      if (( raw > 0 )); then FAN_STATE=running; else FAN_STATE=stopped; fi
+    else
+      FAN_STATE=error
+    fi
+  elif [[ -n "$FAN_RUNNING_FILE" ]]; then
+    raw="$(read_one_line "$FAN_RUNNING_FILE" 2>/dev/null || true)"
+    if [[ "$raw" == "$FAN_RUNNING_ACTIVE_VALUE" ]]; then
+      FAN_STATE=running
+    elif [[ "$raw" == 0 || "$raw" == 1 ]]; then
+      FAN_STATE=stopped
+    else
+      FAN_STATE=error
+    fi
+  elif [[ "$FAN_PERCENT" =~ ^[0-9]+$ ]]; then
+    if (( FAN_PERCENT > 0 )); then FAN_STATE=commanded; else FAN_STATE=off; fi
+  fi
+
+  case "$FAN_STATE" in
+    running)
+      if [[ -n "$FAN_RPM" && -n "$FAN_PERCENT" ]]; then
+        FAN_MESSAGE="Luefter dreht mit $FAN_RPM U/min bei $FAN_PERCENT Prozent Ansteuerung."
+      elif [[ -n "$FAN_RPM" ]]; then
+        FAN_MESSAGE="Luefter dreht mit $FAN_RPM U/min."
+      elif [[ -n "$FAN_PERCENT" ]]; then
+        FAN_MESSAGE="Luefterdrehung ist bestaetigt; Ansteuerung $FAN_PERCENT Prozent."
+      else
+        FAN_MESSAGE='Luefterdrehung ist bestaetigt.'
+      fi
+      ;;
+    stopped) FAN_MESSAGE='Luefter dreht nicht.' ;;
+    off) FAN_MESSAGE='Luefter wird mit 0 Prozent angesteuert; keine Drehzahlmessung vorhanden.' ;;
+    commanded) FAN_MESSAGE="Luefter wird mit $FAN_PERCENT Prozent angesteuert; die echte Drehung ist ohne Tachosignal nicht pruefbar." ;;
+    error) FAN_MESSAGE='Luefterrueckmeldung ist nicht lesbar.' ;;
+  esac
+
+  write_read_counters || true
+  write_status
+  [[ "$SENSOR_STATE" != ok ]] || append_history
+  if [[ -n "$SENSOR_OPERATION_LOCK_FD" ]]; then
+    /usr/bin/flock -u "$SENSOR_OPERATION_LOCK_FD" || true
+    exec {SENSOR_OPERATION_LOCK_FD}>&-
+    SENSOR_OPERATION_LOCK_FD=""
+  fi
+}
+
+load_config
+(( CHECK_ONLY == 0 )) || { printf 'Sensor-Konfiguration ist gueltig.\n'; exit 0; }
+prepare_status_root
+SENSOR_OPERATION_LOCK="${CAMERA_RPI_OPERATION_LOCK:-/run/lock/camera-rpi.operation.lock}"
+
+while :; do
+  sample_once
+  (( RUN_ONCE == 0 )) || break
+  if (( SENSOR_LOCK_BUSY )); then
+    sleep 1
+  else
+    sleep "$SAMPLE_SECONDS"
+  fi
+done

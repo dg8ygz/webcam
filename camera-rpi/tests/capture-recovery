@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Real common capture wrapper, simulated camera/power. Never touches GPIO.
+set -euo pipefail
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source "$PROJECT/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_POWER_HELPER="$STAGE/power.php" RECOVERY_LOG="$STAGE/events"
+export CAMERA_RPI_CLIMATE_CONFIG="$STAGE/no-climate"
+export CAMERA_RPI_GPHOTO_BIN="$STAGE/gphoto"
+cat > "$CAMERA_RPI_POWER_HELPER" <<'PHP'
+<?php
+file_put_contents(getenv('RECOVERY_LOG'),$argv[1]."\n",FILE_APPEND);
+if ($argv[1]==='capture_ready' && getenv('NOT_READY')==='1') exit(1);
+PHP
+printf '#!/bin/sh\nexit 8\n' > "$CAMERA_RPI_GPHOTO_BIN"
+chmod 700 "$CAMERA_RPI_GPHOTO_BIN"
+CAPTURE_BACKEND=gphoto2 GPHOTO_CAPTURE_MODE=standard GPHOTO_TIMEOUT_SECONDS=5
+CR_CAPTURE_ATTEMPT_MARKER="$STAGE/attempted"
+cr_focus_gpio() { return 0; }
+if NOT_READY=1 cr_capture_backend_to_file "$STAGE/image"; then exit 1; fi
+test ! -e "$CR_CAPTURE_ATTEMPT_MARKER"
+cr_capture_recovery failed
+test "$(wc -l < "$RECOVERY_LOG")" = 1
+if cr_capture_backend_to_file "$STAGE/image"; then exit 1; fi
+test -e "$CR_CAPTURE_ATTEMPT_MARKER"
+cr_capture_recovery failed
+test "$(grep -c '^capture_failed$' "$RECOVERY_LOG")" = 1
+rm "$CR_CAPTURE_ATTEMPT_MARKER"
+cr_focus_gpio() { return 1; }
+if cr_capture_backend_to_file "$STAGE/image"; then exit 1; fi
+test ! -e "$CR_CAPTURE_ATTEMPT_MARKER"
+cr_capture_recovery failed
+test "$(grep -c '^capture_failed$' "$RECOVERY_LOG")" = 1
+CAPTURE_BACKEND=rtsp
+: > "$CR_CAPTURE_ATTEMPT_MARKER"
+cr_capture_recovery failed
+test "$(grep -c '^capture_failed$' "$RECOVERY_LOG")" = 1
+printf 'OK: recovery counts physical gphoto attempts only; OFF/readiness/focus/RTSP excluded\n'

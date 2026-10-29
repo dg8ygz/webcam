@@ -1,0 +1,8 @@
+MAILTO=
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# LEGACY/DISABLED: ersetzt durch den internen Kamera-Poll-Zeitgeber.
+# Aktivierung und Uhrzeit werden unter Admin > Scripte gepflegt.
+# LEGACY 00:20 - der neue abhaengige Lauf ist intern auf 03:30 konfiguriert.
+# 20 0 * * * www-data cd /var/www/html/webcam && WEBCAM_CONFIG_DB=/var/lib/webcam/webcams.sqlite bash bin/weather_quality_previous_day.sh >> var/log/weather_quality.log 2>&1

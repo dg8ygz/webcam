@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Read-only fixed-unit journal bridge, key redaction, unknown target/injection
+# and failing journal. No live services, system journal or GPIO.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-admin-logs.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+export CAMERA_RPI_COMMON_LIB="$PROJECT/scripts/lib/camera-rpi-common.sh"
+export CAMERA_RPI_CONFIG_DIR="$STAGE/etc" CAMERA_RPI_KEY_DIR="$STAGE/keys"
+export CAMERA_RPI_RUNTIME_ROOT="$STAGE/run" CAMERA_RPI_OPERATION_LOCK="$STAGE/lock"
+export CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_ALLOW_NONROOT_CONFIG=1
+export CAMERA_RPI_JOURNAL_BIN="$PROJECT/tests/fixtures/fake-journal"
+export CAMERA_RPI_POOL_CONFIG="$STAGE/no-pool"
+mkdir -p "$STAGE/etc" "$STAGE/keys" "$STAGE/run"
+printf 'action=save\nserver_id=journal-test\nserver_base_url=https://fixture.invalid/webcam\ncamera_slug=test\nkey_mode=replace\nkey=key-journal-12345\n' \
+  | bash "$PROJECT/scripts/admin/camera-rpi-admin" > /dev/null
+before="$(sha256sum "$STAGE/etc/journal-test.conf" "$STAGE/keys/journal-test.key")"
+# Exercise the same stdin boundary as PHP; fixtures replace only the journal.
+logs() { printf 'action=logs\nserver_id=%s\n' "$1" | bash "$PROJECT/scripts/admin/camera-rpi-admin"; }
+logs journal-test > "$STAGE/output"
+[[ "$(wc -l < "$STAGE/output")" == 10 ]]
+! grep -q key-journal-12345 "$STAGE/output"
+grep -q '\[KEY AUSGEBLENDET\]' "$STAGE/output"
+for id in missing '../journal-test' 'journal-test;id' 'journal-test.service' '*'; do
+  if logs "$id" >/dev/null 2>&1; then echo 'Ungueltiges Journalziel akzeptiert'; exit 1; fi
+done
+if FAKE_JOURNAL_FAIL=1 logs journal-test >/dev/null 2>&1; then echo 'Journalfehler verschluckt'; exit 1; fi
+[[ "$before" == "$(sha256sum "$STAGE/etc/journal-test.conf" "$STAGE/keys/journal-test.key")" ]]
+printf 'OK: 10 admin journal checks; scoped last ten, redaction, validation, errors, readonly\n'

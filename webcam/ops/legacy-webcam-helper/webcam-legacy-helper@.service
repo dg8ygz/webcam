@@ -1,0 +1,38 @@
+[Unit]
+Description=Legacy webcam bridge for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=webcam-helper
+Group=webcam-helper
+ExecStart=/usr/local/libexec/webcam-legacy-helper /etc/webcam-legacy-helper/%i.conf
+Restart=always
+RestartSec=5s
+RuntimeDirectory=webcam-legacy-helper/%i
+RuntimeDirectoryMode=0700
+StateDirectory=webcam-legacy-helper
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

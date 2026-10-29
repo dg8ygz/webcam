@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Private filesystem/config fixtures only. Never start services or access GPIO.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$PROJECT/ops/activate-steinhagen.sh"
+source "$PROJECT/ops/update-eos-legacy.sh"
+source "$PROJECT/ops/lib/legacy-install.sh"
+STAGE="$(mktemp -d /tmp/camera-cutover-test.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+LI_ROOT="$STAGE/root"
+AC_PROJECT="$PROJECT"
+ac_paths
+export CAMERA_RPI_CUTOVER_CLIMATE_LIB="$PROJECT/scripts/camera-rpi-climate.php"
+check_count=0
+pass() { ((check_count+=1)); }
+
+# Reproduce root's first-cutover ERR inheritance, not just the final boolean.
+# Expected nonzero systemctl/absent IIO must not emit a false abort. Unknown
+# units and enumeration failures must still fail closed.
+(
+  trap 'printf "unexpected ERR trap\n" >&2' ERR
+  systemctl() { printf 'disabled\n'; return 1; }
+  ac_unit_disabled fixture
+  ac_no_iio "$STAGE/missing-iio/devices"
+) 2> "$STAGE/expected-status.stderr"
+[[ ! -s "$STAGE/expected-status.stderr" ]]; pass
+(
+  systemctl() { printf 'not-found\n'; return 4; }
+  if ac_unit_disabled fixture; then exit 1; fi
+); pass
+mkdir -p "$STAGE/iio"
+ac_no_iio "$STAGE/iio"; pass
+mkdir "$STAGE/iio/iio:device0"
+if ac_no_iio "$STAGE/iio"; then exit 1; fi; pass
+(
+  find() { return 1; }
+  if ac_no_iio "$STAGE/iio"; then exit 1; fi
+); pass
+for path in "${UE_PATHS[@]}"; do mkdir -p "$LI_ROOT/$(dirname "$path")"; done
+for path in "${UE_PATHS[@]:0:5}"; do printf 'original\n' > "$LI_ROOT/$path"; done
+chmod 0600 "$LI_ROOT/etc/camera-rpi/device.conf"
+ue_snapshot "$STAGE/before"
+printf 'replacement\n' > "$STAGE/replacement"
+for path in "${UE_PATHS[@]}"; do ue_publish_file "$STAGE/replacement" "$path" 0644; done
+
+# Simulate pictures captured AFTER cutover, including a still pending upload.
+mkdir -p "$LI_ROOT/var/lib/camera-rpi/spool/steinhagen-legacy/images" "$LI_ROOT/etc/camera-rpi/keys" "$LI_ROOT/tmp"
+printf 'new pending JPEG bytes\n' > "$LI_ROOT/var/lib/camera-rpi/spool/steinhagen-legacy/images/123.jpg"
+printf 'old JPEG bytes\n' > "$LI_ROOT/tmp/raw.jpg"
+printf 'fixture-secret\n' > "$LI_ROOT/etc/camera-rpi/keys/steinhagen-legacy.key"
+ac_data_snapshot "$STAGE/recovery/data"
+mkdir -p "$STAGE/original/data/tmp"
+cp -a "$LI_ROOT/tmp/raw.jpg" "$STAGE/original/data/tmp/raw.jpg"
+printf 'RRD from before cutover\n' > "$STAGE/original/data/tmp/temperature.rrd"
+for path in tmp/raw.jpg var/lib/camera-rpi/spool/steinhagen-legacy/images/123.jpg etc/camera-rpi/keys/steinhagen-legacy.key; do
+  cmp "$LI_ROOT/$path" "$STAGE/recovery/data/$path"; pass
+done
+ue_restore "$STAGE/before" "$STAGE/recovery/files"
+for path in "${UE_PATHS[@]:0:5}"; do cmp "$STAGE/before/$path" "$LI_ROOT/$path"; pass; done
+for path in "${UE_PATHS[@]:5}"; do
+  [[ ! -e "$LI_ROOT/$path" ]]; cmp "$STAGE/replacement" "$STAGE/recovery/files/removed/$path"; pass
+done
+[[ "$(stat -c %a "$LI_ROOT/etc/camera-rpi/device.conf")" == 600 ]]; pass
+cmp "$LI_ROOT/tmp/raw.jpg" "$STAGE/recovery/data/tmp/raw.jpg"; pass
+[[ -s "$LI_ROOT/var/lib/camera-rpi/spool/steinhagen-legacy/images/123.jpg" ]]; pass
+printf 'intermediate legacy image\n' > "$LI_ROOT/tmp/raw.jpg"
+ac_restore_old_ram "$STAGE"
+cmp "$STAGE/original/data/tmp/raw.jpg" "$LI_ROOT/tmp/raw.jpg"; pass
+cmp "$STAGE/original/data/tmp/temperature.rrd" "$LI_ROOT/tmp/temperature.rrd"; pass
+[[ -s "$LI_ROOT/var/lib/camera-rpi/spool/steinhagen-legacy/images/123.jpg" ]]; pass
+ln -s "$STAGE/replacement" "$LI_ROOT/etc/camera-rpi/other-link"
+ln -s "$STAGE/replacement" "$LI_ROOT/tmp/http.jpg"
+if ac_data_snapshot "$STAGE/refused/data" 2>/dev/null; then exit 1; fi; pass
+
+printf 'enabled=false\nkey_file=/private/key\nupload_mode=legacy\ngphoto_capture_mode=eos-legacy\n' > "$STAGE/server"
+ac_enable "$STAGE/server" > "$STAGE/enabled"
+grep -qx enabled=true "$STAGE/enabled"; pass
+[[ "$(tail -n +2 "$STAGE/server")" == "$(tail -n +2 "$STAGE/enabled")" ]]; pass
+printf 'enabled=false\nenabled=false\n' > "$STAGE/duplicate"
+if ac_enable "$STAGE/duplicate" > /dev/null; then exit 1; fi; pass
+if ac_enable /dev/null >/dev/null; then exit 1; fi; pass
+ac_php config "$PROJECT/config/climate.example.json" > "$STAGE/climate.json"
+php -r '$a=json_decode(file_get_contents($argv[1]),true); $b=json_decode(file_get_contents($argv[2]),true); $a["mode"]="auto"; exit($a===$b?0:1);' \
+  "$PROJECT/config/climate.example.json" "$STAGE/climate.json"; pass
+if ac_php config "$STAGE/climate.json" >/dev/null 2>&1; then exit 1; fi; pass
+
+stamp="$(date +%s)"
+printf 'updated_epoch=%s\nsensor_state=ok\ntemperature_c=21.4\nhumidity_percent=53.6\n' "$stamp" > "$STAGE/sensor"
+ac_php sensor "$STAGE/sensor"; pass
+for bad in 'sensor_state=error' 'temperature_c=99' 'humidity_percent=101' 'updated_epoch=1'; do
+  field="${bad%%=*}"
+  sed "s/^$field=.*/$bad/" "$STAGE/sensor" > "$STAGE/bad-sensor"
+  if ac_php sensor "$STAGE/bad-sensor"; then exit 1; fi; pass
+done
+for state in warming idle heating summer capture_pause; do
+  printf 'updated_epoch=%s\nmode=auto\noutputs=gpio\nstate=%s\n' "$stamp" "$state" > "$STAGE/climate-status"
+  ac_php climate "$STAGE/climate-status"; pass
+done
+for bad in 'state=fault' 'state=stopped' 'state=sensor_error' 'outputs=none' 'mode=off' 'updated_epoch=1'; do
+  field="${bad%%=*}"
+  sed "s/^$field=.*/$bad/" "$STAGE/climate-status" > "$STAGE/bad-climate"
+  if ac_php climate "$STAGE/bad-climate"; then exit 1; fi; pass
+done
+for name in "${AC_TEMPLATES[@]}"; do [[ -s "$PROJECT/ops/steinhagen-cutover-files/$name" ]]; pass; done
+[[ "$(systemd-escape -p --suffix=mount /var/lib/camera-rpi/spool)" == "$AC_MOUNT" ]]; pass
+grep -qx 'Options=mode=0700,nosuid,nodev,noatime,size=128M' "$PROJECT/ops/steinhagen-cutover-files/$AC_MOUNT"; pass
+grep -qx 'Before=camera-rpi-worker@steinhagen-legacy.service' "$PROJECT/ops/steinhagen-cutover-files/$AC_MOUNT"; pass
+
+# Failure injection: rollback MUST stop before later destructive transitions
+# when a writer cannot stop or a backup cannot be made. All external actions
+# below are shell stubs; no live systemd/mount/overlay calls are permitted.
+AC_TRACE="$STAGE/actions"
+systemctl() { printf '%s\n' "$*" >> "$AC_TRACE"; [[ "$1" != stop ]]; }
+if ac_restore "$STAGE" >/dev/null 2>&1; then exit 1; fi
+[[ "$(wc -l < "$AC_TRACE")" == 1 ]]; pass
+systemctl() { printf '%s\n' "$*" >> "$AC_TRACE"; [[ "$1" != is-active ]]; }
+ac_data_snapshot() { return 1; }
+: > "$AC_TRACE"
+if ac_restore "$STAGE" >/dev/null 2>&1; then exit 1; fi
+! grep -Eq 'disable|enable|reload' "$AC_TRACE"; pass
+printf 'OK: %s cutover checks; config/status, snapshots, pending-image preservation, rollback failure guards; no hardware/services\n' "$check_count"

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Isolated fixtures only. No real credentials, systemd, remount or camera I/O.
+set -euo pipefail
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$PROJECT/ops/prepare-bielefeld-legacy.sh"
+source "$PROJECT/scripts/lib/camera-rpi-common.sh"
+stage="$(mktemp -d /tmp/camera-bielefeld-config-test.XXXXXXXX)"
+trap 'rm -f -- "$stage/input" "$stage/key" "$stage/server.conf"; rmdir -- "$stage"' EXIT
+umask 077
+count=0
+for fixture in \
+  'wc_key="fake-Token_123"' \
+  "wc_key='fake-Token_123'" \
+  'wc_key=fake-Token_123' \
+  '  export wc_key="fake-Token_123" # comment'; do
+  printf '#wc_key="ignored-Token_123"\n%s\n' "$fixture" > "$stage/input"
+  bl_read_key "$stage/input"
+  [[ "$BL_KEY" == fake-Token_123 ]]
+  ((count += 1))
+done
+for fixture in \
+  '#wc_key="fake-Token_123"' \
+  $'wc_key="fake-Token_123"\nwc_key="another-Token_123"' \
+  'wc_key="$(touch /SHOULD-NEVER-RUN)"' \
+  'wc_key="${SECRET}"' \
+  'wc_key="fake-Token_123"; anything' \
+  'wc_key=""' \
+  'wc_key="short"' \
+  'wc_key= fake-Token_123' \
+  'wc_key="fake-Token_123"unparsed'; do
+  printf '%s\n' "$fixture" > "$stage/input"
+  if bl_read_key "$stage/input" 2>/dev/null; then
+    printf 'FAIL: invalid assignment accepted\n' >&2
+    exit 1
+  fi
+  [[ ! -v BL_KEY ]]
+  ((count += 1))
+done
+printf 'wc_key="fake-Token_123"\r\n' > "$stage/input"
+bl_read_key "$stage/input"
+[[ "$BL_KEY" == fake-Token_123 ]]
+((count += 1))
+printf '%s\n' "$BL_KEY" > "$stage/key"
+unset BL_KEY
+bl_render_config "$stage/key" > "$stage/server.conf"
+CAMERA_RPI_ALLOW_NONROOT_CONFIG=1
+cr_load_server_config "$stage/server.conf"
+cr_read_secret "$KEY_FILE"
+[[ "$CR_SECRET" == fake-Token_123 ]]
+unset CR_SECRET
+[[ "$SERVER_ID" == bielefeld-legacy && "$CAMERA_SLUG" == bielefeld && "$ENABLED" == 0 ]]
+[[ "$COMMAND_URL" == http://192.0.2.2/webcam/include/command.php ]]
+[[ "$UPLOAD_URL" == http://192.0.2.2/webcam/include/upload.php ]]
+[[ "$UPLOAD_MODE" == legacy && "$COMMAND_TIMEOUT_SECONDS" == 700 && "$CAPTURE_BACKEND" == gphoto2 ]]
+[[ "$GPHOTO_CAPTURE_MODE" == eos-legacy ]]
+[[ "$MANAGE_ROOT_MOUNT" == 1 ]]
+((count += 6))
+printf 'OK: %s Bielefeld-Konfigurationspruefungen; keine echten Keys/Dienste/GPIO.\n' "$count"

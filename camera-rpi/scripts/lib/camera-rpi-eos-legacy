@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Canon-EOS-Ausloeseablauf aus webcam_capture (Flori Radlherr, Foto-Webcam.eu;
+# Raspberry-Pi-Anpassung Olaf Polan). Dieser Helfer macht und empfaengt ein Foto.
+# Zugangsdaten, Upload und GPIO-Steuerung werden an anderer Stelle behandelt.
+# Der Aufrufer muss die Kamera exklusiv sperren und die Gesamtlaufzeit begrenzen.
+# Nur der hier gestartete gphoto-Prozess darf durch den Download-Helfer beendet
+# werden; andere Kamera-/USB-Prozesse duerfen davon nicht betroffen sein.
+set -euo pipefail
+umask 077
+
+# gphoto ruft diesen "Hook" auf, nachdem es die Datei gespeichert hat.
+# Wie im alten Kameraskript noch zwei Sekunden warten und dann diesen gphoto-
+# Prozess beenden: Das umgeht bekannte Haenger beim weiteren Warten/Loeschen.
+# Vorher Prozessnummer (PID), Elternprozess (PPID) und Zieldatei vergleichen,
+# damit kein fremder Prozess beendet oder ein fremdes Bild bestaetigt wird.
+eos_download_hook() {
+  [[ "${ACTION:-}" == download ]] || return 0
+  [[ "${CAMERA_RPI_EOS_PID:-}" =~ ^[1-9][0-9]+$ \
+     && "$PPID" == "$CAMERA_RPI_EOS_PID" \
+     && "${ARGUMENT:-}" == "${CAMERA_RPI_EOS_TARGET:-}" \
+     && -f "$ARGUMENT" && ! -L "$ARGUMENT" ]] || return 1
+  # RAW-Dateien und offensichtlich unvollstaendige JPEGs nicht bestaetigen.
+  if eos_jpeg_valid "$ARGUMENT" "$CAMERA_RPI_EOS_MAX_BYTES"; then
+    printf 'download-complete\n' > "$CAMERA_RPI_EOS_MARKER"
+  fi
+  sleep 2
+  kill -KILL "$PPID"
+}
+
+# Schneller Vorcheck: Dateigroesse und JPEG-Anfang/-Ende pruefen. Das beweist
+# noch kein lesbares Bild! Vor der Veroeffentlichung folgt im Worker die
+# vollstaendige Dekodierung, also das tatsaechliche Einlesen der Bilddaten.
+eos_jpeg_valid() {
+  local size start end
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  size="$(stat -c %s -- "$1")" || return 1
+  (( size >= 1024 && size <= $2 )) || return 1
+  start="$(od -An -N2 -tx1 -- "$1")" || return 1
+  end="$(tail -c 2 -- "$1" | od -An -tx1)" || return 1
+  [[ "${start// /}" == ffd8 && "${end// /}" == ffd9 ]]
+}
+
+eos_capture() {
+  local target="$1" max_bytes="$2" port="${3:-}" child='' marker rc=0
+  local gphoto="${CAMERA_RPI_GPHOTO_BIN:-/usr/bin/gphoto2}"
+  local timeout_bin="${CAMERA_RPI_TIMEOUT_BIN:-/usr/bin/timeout}"
+  local self
+  self="$(realpath -- "${BASH_SOURCE[0]}")"
+  [[ "$target" == /* && ! -e "$target" && ! -L "$target" \
+     && "$max_bytes" =~ ^[1-9][0-9]{3,8}$ ]] || return 1
+  (( max_bytes >= 1024 && max_bytes <= 104857600 )) || return 1
+  [[ -z "$port" || "$port" =~ ^usb:[0-9]{3},[0-9]{3}$ ]] || return 1
+  [[ -x "$gphoto" && -x "$self" ]] || return 1
+  local -a camera_args=()
+  [[ -z "$port" ]] || camera_args=(--port "$port")
+  marker="$(mktemp "$(dirname -- "$target")/.eos-download.XXXXXXXX")"
+
+  # Auch bei Fehler oder normalem Abbruch den Ausloeser wieder freigeben.
+  # Zuerst den eigenen gphoto-Prozess beenden und auf sein Ende warten, damit
+  # nicht zwei Programme gleichzeitig USB-Kommandos an die Kamera senden.
+  # Die Freigabe hat ein eigenes Limit: 10 Sekunden plus 2 Sekunden bis KILL.
+  # Der aeussere Timeout muss deshalb mindestens 15 Sekunden Abbruchfrist lassen.
+  # Bei Stromausfall/SIGKILL ist Aufraeumen unmoeglich; fehlende Freigabe ist Fehler.
+  eos_finish() {
+    local result=$?
+    # Weitere normale Abbruchsignale jetzt ignorieren, auch in Kindprozessen:
+    # Ein zweites TERM darf die noch laufende Freigabe nicht unterbrechen.
+    # Das eigene Zeitlimit beendet einen haengenden Freigabeversuch trotzdem.
+    trap '' HUP INT TERM
+    trap - EXIT
+    if [[ -n "$child" ]]; then
+      kill -KILL "$child" 2>/dev/null || true
+      wait "$child" 2>/dev/null || true
+    fi
+    if ! LC_ALL=C "$timeout_bin" --signal=TERM --kill-after=2 10s \
+      "$gphoto" "${camera_args[@]}" --set-config-value "eosremoterelease=Release Full"; then
+      printf 'EOS: Ruecksetzen von Release Full fehlgeschlagen.\n' >&2
+      result=1
+    fi
+    rm -f -- "$marker"
+    exit "$result"
+  }
+  trap eos_finish EXIT
+  trap "trap '' HUP INT TERM; exit 143" HUP TERM
+  trap "trap '' HUP INT TERM; exit 130" INT
+  ulimit -f "$(((max_bytes + 1023) / 1024))"
+  (
+    # gphoto2 2.5.28 legt temporaere Dateien im aktuellen Arbeitsverzeichnis
+    # an, selbst bei absolutem --filename. Bei systemd ist das sonst oft /,
+    # auf unseren Pis schreibgeschuetzt. Dann landet der Download eventuell
+    # nur im Arbeitsspeicher und nicht in der benoetigten JPEG-Datei.
+    # Deshalb in das beschreibbare, private Bildverzeichnis wechseln.
+    cd -- "$(dirname -- "$target")" || exit 1
+    # exec ersetzt die Shell durch gphoto mit derselben Prozessnummer.
+    # Der Download-Helfer kann daran seinen richtigen Elternprozess erkennen.
+    export CAMERA_RPI_EOS_PID="$BASHPID" CAMERA_RPI_EOS_TARGET="$target"
+    export CAMERA_RPI_EOS_MARKER="$marker" CAMERA_RPI_EOS_MAX_BYTES="$max_bytes"
+    export LC_ALL=C
+    unset ACTION ARGUMENT
+    # Ausloesen wie in libgphoto2 examples/best-iso.c: Immediate, dann
+    # Release Full. Den Ausloeser VOR dem Warten auf den Download freigeben;
+    # nur beim Aufraeumen waere zu spaet. Namen statt Zahlen verwenden:
+    # Die Nummer eines Listeneintrags ist nicht der USB-Protokollwert.
+    exec "$gphoto" "${camera_args[@]}" --keep --filename "$target" \
+      --set-config-value "eosremoterelease=Release Half" --wait-event=5s \
+      --set-config-value eosremoterelease=Immediate \
+      --set-config-value "eosremoterelease=Release Full" --capture-tethered=80s \
+      --hook-script="$self"
+  ) &
+  child=$!
+  wait "$child" || rc=$?
+  child=''
+  # Exit 137 ist hier nur zusammen mit der Download-Bestaetigung UND dem
+  # JPEG-Vorcheck erfolgreich. Umgekehrt ist Exit 0 ohne Bild kein Erfolg:
+  # gphoto kann nach 80 Sekunden ereignislosem Warten regulaer enden.
+  [[ "$rc" == 137 ]] && grep -qx download-complete "$marker" \
+    && eos_jpeg_valid "$target" "$max_bytes" \
+    || { printf 'EOS: Kein bestaetigter vollstaendiger JPEG-Download (exit=%s).\n' "$rc" >&2; exit 1; }
+  # Innerhalb der Funktion beenden, damit die EXIT-Aufraeumfunktion noch
+  # auf die lokalen Werte dieses Aufnahmeversuchs zugreifen kann.
+  exit 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [[ -n "${ACTION:-}" ]]; then
+    eos_download_hook
+  elif [[ "${1:-}" == --capture && ( $# == 3 || $# == 4 ) ]]; then
+    eos_capture "$2" "$3" "${4:-}"
+  else
+    printf 'Aufruf: camera-rpi-eos-legacy --capture ABSOLUTES-ZIEL MAX-BYTES [usb:BBB,DDD]\n' >&2
+    exit 2
+  fi
+fi

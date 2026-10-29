@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Real daemon and flock with file-backed readings; no IIO, GPIO or services.
+# Prove camera priority, prompt recovery, normal cadence and --once behavior.
+set -euo pipefail
+umask 077
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d)"
+SENSOR_PID=''
+cleanup() {
+  if [[ -n "$SENSOR_PID" ]]; then
+    kill "$SENSOR_PID" 2>/dev/null || true
+    wait "$SENSOR_PID" 2>/dev/null || true
+  fi
+  rm -rf -- "$STAGE"
+}
+trap cleanup EXIT
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+printf '21400\n' > "$STAGE/temperature"
+printf '53600\n' > "$STAGE/humidity"
+printf 'enabled=true\nsample_seconds=5\ntemperature_file=%s\nhumidity_file=%s\n' \
+  "$STAGE/temperature" "$STAGE/humidity" > "$STAGE/device.conf"
+export CAMERA_RPI_SENSOR_TEST_MODE=1 CAMERA_RPI_STATUS_GROUP=''
+export CAMERA_RPI_STATUS_ROOT="$STAGE/status" CAMERA_RPI_OPERATION_LOCK="$STAGE/camera.lock"
+exec 9>"$CAMERA_RPI_OPERATION_LOCK"
+flock -n 9
+# The child must not inherit our lock-owning descriptor.
+timeout 2 bash "$PROJECT_DIR/scripts/camera-rpi-sensor" --once "$STAGE/device.conf" 9>&-
+[[ ! -e "$STAGE/status/current.status" ]] || fail '--once read during capture'
+bash "$PROJECT_DIR/scripts/camera-rpi-sensor" "$STAGE/device.conf" 9>&- > "$STAGE/output" 2>&1 &
+SENSOR_PID=$!
+sleep 2.2
+kill -0 "$SENSOR_PID"
+[[ ! -e "$STAGE/status/current.status" && ! -e "$STAGE/status/history.tsv" \
+   && ! -e "$STAGE/status/sensor-read-counters.status" ]] || fail 'Busy lock published data'
+released="$(date +%s%N)"
+flock -u 9
+for ((i=0; i<40; i++)); do
+  [[ -f "$STAGE/status/current.status" ]] && break
+  kill -0 "$SENSOR_PID" || fail 'Daemon stopped'
+  sleep 0.05
+done
+[[ -f "$STAGE/status/current.status" ]] || fail 'Did not measure within two seconds of release'
+elapsed=$(( ($(date +%s%N) - released) / 1000000 ))
+(( elapsed < 2000 )) || fail 'Waited full sample interval after capture'
+grep -qx 'sensor_state=ok' "$STAGE/status/current.status"
+grep -qx 'temperature_c=21.4' "$STAGE/status/current.status"
+grep -qx 'humidity_percent=53.6' "$STAGE/status/current.status"
+grep -qx 'cycles=1' "$STAGE/status/sensor-read-counters.status"
+grep -qx 'attempts=1' "$STAGE/status/sensor-read-counters.status"
+cp "$STAGE/status/current.status" "$STAGE/first.status"
+sleep 2
+cmp "$STAGE/first.status" "$STAGE/status/current.status" || fail 'Normal cadence accelerated'
+# Reacquire before the next regular measurement and keep it across that due time.
+flock -n 9
+sleep 4
+cmp "$STAGE/first.status" "$STAGE/status/current.status" || fail 'Busy lock refreshed old data'
+[[ $(wc -l < "$STAGE/status/history.tsv") == 1 ]] || fail 'Busy lock appended history'
+flock -u 9
+for ((i=0; i<40; i++)); do
+  [[ $(wc -l < "$STAGE/status/history.tsv") == 2 ]] && break
+  kill -0 "$SENSOR_PID" || fail 'Daemon stopped during second capture'
+  sleep 0.05
+done
+[[ $(wc -l < "$STAGE/status/history.tsv") == 2 ]] || fail 'Second capture recovery failed'
+grep -qx 'cycles=2' "$STAGE/status/sensor-read-counters.status"
+grep -qx 'attempts=2' "$STAGE/status/sensor-read-counters.status"
+printf 'OK: busy camera blocks reads, recovery %s ms, normal cadence, unchanged stale status, two captures and --once\n' "$elapsed"

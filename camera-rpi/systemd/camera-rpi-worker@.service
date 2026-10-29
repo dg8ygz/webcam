@@ -1,0 +1,35 @@
+[Unit]
+Description=Camera-RPi Worker fuer Zielserver %i
+Documentation=file:/usr/local/share/doc/camera-rpi/README.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/camera-rpi/servers/%i.conf
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/camera-rpi-worker /etc/camera-rpi/servers/%i.conf
+Restart=on-failure
+RestartSec=20s
+TimeoutStopSec=150s
+KillSignal=SIGTERM
+
+# Die Kamera und das kontrollierte Remounten von / erfordern hier bewusst
+# root. Unabhaengig davon werden typische Privileg-Eskalationswege begrenzt.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

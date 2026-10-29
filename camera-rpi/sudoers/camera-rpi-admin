@@ -1,0 +1,3 @@
+# www-data darf genau die Admin-Bruecke ohne Argumente starten, keine Shell
+# und kein anderes Root-Programm. Die Bruecke validiert alle Daten nochmals.
+www-data ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/camera-rpi-admin ""

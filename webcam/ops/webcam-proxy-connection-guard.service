@@ -1,0 +1,22 @@
+[Unit]
+Description=Limit abusive connections to the public webcam proxy
+Wants=network-online.target
+After=network-online.target
+Before=fail2ban.service
+
+[Service]
+Type=oneshot
+
+# Eine alte Instanz wird vor Start beziehungsweise Reload nur aus der eigenen
+# Tabelle entfernt. Das vorangestellte Minus macht den ersten Start ohne
+# vorhandene Tabelle idempotent; andere nftables-/Fail2Ban-Tabellen bleiben
+# unangetastet.
+ExecStartPre=-/usr/sbin/nft delete table inet webcam_proxy_guard
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/webcam-proxy-connection-guard.nft
+ExecReload=-/usr/sbin/nft delete table inet webcam_proxy_guard
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/webcam-proxy-connection-guard.nft
+ExecStop=-/usr/sbin/nft delete table inet webcam_proxy_guard
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

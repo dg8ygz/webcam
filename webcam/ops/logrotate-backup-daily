@@ -1,0 +1,9 @@
+/var/www/html/webcam/var/log/backup_daily.log {
+  su www-data www-data
+  weekly
+  rotate 4
+  compress
+  missingok
+  notifempty
+  create 640 www-data www-data
+}

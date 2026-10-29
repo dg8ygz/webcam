@@ -1,0 +1,161 @@
+#!/bin/bash
+set -euo pipefail
+
+# Synchronisiert die expliziten Schreibausnahmen des Apache-Mount-Namespace mit
+# den Kameras aus der lokalen Config-DB. Das Skript wird als root installiert;
+# die Webanwendung kann es weder verändern noch selbst ausführen.
+
+PROJECT_ROOT="${WEBCAM_PROJECT_ROOT:-/var/www/html/webcam}"
+CONFIG_DB="${WEBCAM_CONFIG_DB:-/var/lib/webcam/webcams.sqlite}"
+DROPIN="${WEBCAM_APACHE_DROPIN:-}"
+APACHE_SERVICE="${WEBCAM_APACHE_SERVICE:-apache2.service}"
+MODE='--check'
+
+# Optionen statt fest eingebauter PROD-/DEV-Pfade erlauben, dass derselbe
+# root-owned Helfer beide Installationen auf einem gemeinsamen Apache-Host
+# sicher verwaltet. Jede Projektwurzel erhält eine eigene systemd-Drop-in-Datei.
+while [ "$#" -gt 0 ]
+do
+  case "$1" in
+    --check|--apply)
+      MODE="$1"
+      shift
+      ;;
+    --project-root|--config-db|--dropin|--apache-service)
+      if [ "$#" -lt 2 ]; then
+        echo "ABBRUCH: Wert für $1 fehlt." >&2
+        exit 2
+      fi
+      OPTION="$1"
+      OPTION_VALUE="$2"
+      shift 2
+      case "$OPTION" in
+        --project-root) PROJECT_ROOT="$OPTION_VALUE" ;;
+        --config-db) CONFIG_DB="$OPTION_VALUE" ;;
+        --dropin) DROPIN="$OPTION_VALUE" ;;
+        --apache-service) APACHE_SERVICE="$OPTION_VALUE" ;;
+      esac
+      ;;
+    *)
+      echo "Aufruf: $0 [--check|--apply] [--project-root PFAD] [--config-db PFAD] [--dropin PFAD]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ABBRUCH: Dieses Skript muss als root laufen." >&2
+  exit 1
+fi
+
+INSTANCE_NAME="$(basename "$PROJECT_ROOT")"
+if [[ ! "$INSTANCE_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "ABBRUCH: Projektname ist für eine systemd-Datei ungeeignet: $INSTANCE_NAME" >&2
+  exit 1
+fi
+if [ -z "$DROPIN" ]; then
+  DROPIN="/etc/systemd/system/apache2.service.d/webcam-code-readonly-$INSTANCE_NAME.conf"
+fi
+PRIVATE_DB_ROOT="$(dirname "$CONFIG_DB")"
+
+for REQUIRED_COMMAND in sqlite3 install mktemp cmp systemctl
+do
+  command -v "$REQUIRED_COMMAND" >/dev/null || {
+    echo "ABBRUCH: Kommando fehlt: $REQUIRED_COMMAND" >&2
+    exit 1
+  }
+done
+
+if [ ! -r "$CONFIG_DB" ]; then
+  echo "ABBRUCH: Config-DB ist nicht lesbar: $CONFIG_DB" >&2
+  exit 1
+fi
+
+mapfile -t CAMERA_SLUGS < <(
+  sqlite3 -readonly "$CONFIG_DB" \
+    'SELECT slug FROM cameras ORDER BY slug;'
+)
+
+if [ "${#CAMERA_SLUGS[@]}" -eq 0 ]; then
+  echo "ABBRUCH: Keine Kameras in $CONFIG_DB gefunden." >&2
+  exit 1
+fi
+
+for CAMERA_SLUG in "${CAMERA_SLUGS[@]}"
+do
+  if [[ ! "$CAMERA_SLUG" =~ ^[a-z0-9-]+$ ]]; then
+    echo "ABBRUCH: Ungültiger Kamera-Slug in der DB: $CAMERA_SLUG" >&2
+    exit 1
+  fi
+done
+
+DROPIN_DIR="$(dirname "$DROPIN")"
+install -d -o root -g root -m 0755 "$DROPIN_DIR"
+DROPIN_TMP="$(mktemp "$DROPIN_DIR/.webcam-code-readonly.XXXXXX")"
+trap 'unlink "$DROPIN_TMP" 2>/dev/null || true' EXIT
+
+# Der feste Kopf bindet zuerst die Projektwurzel als echte Mount-Abhängigkeit
+# ein. Das ist besonders bei x-systemd.automount wichtig: Ohne diese Reihenfolge
+# kann systemd den Apache-Namespace aufbauen, während der CIFS-Mount noch nicht
+# verfügbar ist, und mit status=226/NAMESPACE abbrechen. Danach schützt der
+# Service-Abschnitt den gesamten Projektbaum und öffnet nur die notwendigen
+# Laufzeitverzeichnisse. Die kamerabezogenen Zeilen werden aus der DB erzeugt.
+{
+  printf '%s\n' \
+    '# Automatisch erzeugt durch webcam-sync-apache-runtime-paths.' \
+    '# Manuelle Änderungen werden beim nächsten --apply überschrieben.' \
+    '[Unit]' \
+    "RequiresMountsFor=$PROJECT_ROOT" \
+    '' \
+    '[Service]' \
+    "ReadOnlyPaths=$PROJECT_ROOT" \
+    "ReadWritePaths=$PRIVATE_DB_ROOT" \
+    "ReadWritePaths=$PROJECT_ROOT/var" \
+    "ReadWritePaths=$PROJECT_ROOT/cache" \
+    "ReadWritePaths=$PROJECT_ROOT/storage"
+
+  for CAMERA_SLUG in "${CAMERA_SLUGS[@]}"
+  do
+    # Cache-based cameras need no per-camera mount or legacy directory.
+    [ -d "$PROJECT_ROOT/cache/$CAMERA_SLUG/current" ] && continue
+    printf 'ReadWritePaths=%s/%s/current\n' "$PROJECT_ROOT" "$CAMERA_SLUG"
+  done
+} > "$DROPIN_TMP"
+chmod 0644 "$DROPIN_TMP"
+
+if [ -r "$DROPIN" ] && cmp -s "$DROPIN_TMP" "$DROPIN"; then
+  echo "OK: Apache-Schreibausnahmen sind bereits aktuell."
+  exit 0
+fi
+
+if [ "$MODE" = '--check' ]; then
+  echo "AKTION NÖTIG: Apache-Schreibausnahmen weichen von der Config-DB ab."
+  # Die vollständigen, shell-sicher maskierten Werte sind hier wichtig:
+  # Ein PROD-Check darf auf einem gemeinsamen Host niemals einen verkürzten
+  # Apply-Befehl mit den DEV-Standardpfaden vorschlagen.
+  printf 'Als root ausführen:'
+  printf ' %q' \
+    "$0" \
+    --apply \
+    --project-root "$PROJECT_ROOT" \
+    --config-db "$CONFIG_DB" \
+    --dropin "$DROPIN" \
+    --apache-service "$APACHE_SERVICE"
+  printf '\n'
+  exit 3
+fi
+
+# Current-Verzeichnisse werden vor dem Dienstneustart im Host-Namespace
+# angelegt. Apache selbst darf den schreibgeschützten Kamera-Root nicht ändern.
+for CAMERA_SLUG in "${CAMERA_SLUGS[@]}"
+do
+  [ -d "$PROJECT_ROOT/cache/$CAMERA_SLUG/current" ] && continue
+  install -d -o www-data -g www-data -m 0775 \
+    "$PROJECT_ROOT/$CAMERA_SLUG/current"
+done
+
+install -o root -g root -m 0644 "$DROPIN_TMP" "$DROPIN"
+systemctl daemon-reload
+systemctl restart "$APACHE_SERVICE"
+
+echo "OK: Apache-Schreibausnahmen synchronisiert; $APACHE_SERVICE neu gestartet."

@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+
+# Lesbarer Gesamtcheck fuer Monitoring und Fehlersuche. Das Script veraendert
+# nichts. Exitcodes: 0 = OK, 1 = Warnung, 2 = Fehler.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+COMMON_LIB="${CAMERA_RPI_COMMON_LIB:-$SCRIPT_DIR/lib/camera-rpi-common.sh}"
+if [[ -z "${CAMERA_RPI_COMMON_LIB:-}" && ! -r "$COMMON_LIB" ]]; then
+  COMMON_LIB="/usr/local/libexec/camera-rpi-common.sh"
+fi
+# shellcheck source=lib/camera-rpi-common.sh
+source "$COMMON_LIB"
+
+CONFIG_DIR="${CAMERA_RPI_CONFIG_DIR:-/etc/camera-rpi/servers}"
+SYSTEMCTL_BIN="${CAMERA_RPI_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+FINDMNT_BIN="${CAMERA_RPI_FINDMNT_BIN:-/usr/bin/findmnt}"
+TEST_MODE="${CAMERA_RPI_HEALTH_TEST_MODE:-0}"
+SENSOR_CONFIG="${CAMERA_RPI_SENSOR_CONFIG:-/etc/camera-rpi/device.conf}"
+SENSOR_BIN="${CAMERA_RPI_SENSOR_BIN:-/usr/local/libexec/camera-rpi-sensor}"
+STATUS_ROOT="${CAMERA_RPI_STATUS_ROOT:-/run/camera-rpi-status}"
+EXPECT_ROOT=ro
+for argument in "$@"; do
+  case "$argument" in
+    --expect-root=ro) EXPECT_ROOT=ro ;;
+    --expect-root=rw) EXPECT_ROOT=rw ;;
+    -h|--help)
+      printf 'Aufruf: camera-rpi-healthcheck [--expect-root=ro|--expect-root=rw]\n'
+      exit 0 ;;
+    *) printf 'Unbekannte Option: %s\n' "$argument" >&2; exit 2 ;;
+  esac
+done
+overall=0
+checked=0
+messages=()
+declare -A key_owner=()
+
+raise_status() {
+  local wanted="$1"
+  shift
+  (( wanted > overall )) && overall="$wanted"
+  messages+=("$*")
+}
+
+status_value() {
+  local file="$1"
+  local wanted="$2"
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "${line%%=*}" == "$wanted" ]] || continue
+    printf '%s' "${line#*=}"
+    return
+  done < "$file"
+}
+
+count_matching() {
+  local directory="$1"
+  local suffix="$2"
+  local item
+  local count=0
+  shopt -s nullglob
+  for item in "$directory"/*"$suffix"; do ((count += 1)); done
+  shopt -u nullglob
+  printf '%s' "$count"
+}
+
+if [[ ! -d "$CONFIG_DIR" ]]; then
+  printf 'CRITICAL - Konfigurationsverzeichnis fehlt: %s\n' "$CONFIG_DIR"
+  exit 2
+fi
+
+shopt -s nullglob
+for config in "$CONFIG_DIR"/*.conf; do
+  ((checked += 1))
+  if ! cr_load_server_config "$config" >/dev/null 2>&1; then
+    raise_status 2 "$(basename -- "$config"): Konfiguration oder Key ungueltig"
+    continue
+  fi
+  cr_read_secret "$KEY_FILE" >/dev/null 2>&1
+  key_digest="$(printf '%s' "$CR_SECRET" | sha256sum)"
+  key_digest="${key_digest%% *}"
+  unset CR_SECRET
+  if [[ -n "${key_owner[$key_digest]+x}" ]]; then
+    raise_status 2 "$SERVER_ID: Key wird auch von ${key_owner[$key_digest]} benutzt"
+  else
+    key_owner[$key_digest]="$SERVER_ID"
+  fi
+  (( ENABLED == 1 )) || { messages+=("$SERVER_ID: deaktiviert"); continue; }
+
+  if [[ "$TEST_MODE" != "1" ]] \
+      && ! "$SYSTEMCTL_BIN" is-active --quiet "camera-rpi-worker@$SERVER_ID.service"; then
+    raise_status 2 "$SERVER_ID: Worker nicht aktiv"
+  fi
+
+  heartbeat_file="$SERVER_RUNTIME_DIR/heartbeat"
+  if [[ ! -r "$heartbeat_file" ]]; then
+    raise_status 2 "$SERVER_ID: kein Heartbeat"
+  else
+    heartbeat_epoch="$(head -n 1 "$heartbeat_file")"
+    if [[ ! "$heartbeat_epoch" =~ ^[0-9]+$ ]]; then
+      raise_status 2 "$SERVER_ID: Heartbeat ungueltig"
+    elif (( $(date +%s) - heartbeat_epoch > OPERATION_LOCK_TIMEOUT_SECONDS + GPHOTO_TIMEOUT_SECONDS + UPLOAD_TIMEOUT_SECONDS + ERROR_BACKOFF_SECONDS + 60 )); then
+      raise_status 2 "$SERVER_ID: Heartbeat zu alt"
+    fi
+  fi
+
+  status_file="$SERVER_RUNTIME_DIR/status"
+  if [[ -r "$status_file" ]]; then
+    state="$(status_value "$status_file" state)"
+    [[ "$state" != "critical" ]] || raise_status 2 "$SERVER_ID: kritischer Laufzeitfehler"
+    [[ "$state" != "error" && "$state" != "rejected" ]] \
+      || raise_status 1 "$SERVER_ID: Status $state"
+  fi
+
+  requests="$(count_matching "$SERVER_SPOOL_DIR/requests" .request)"
+  runtime_requests="$(count_matching "$SERVER_RUNTIME_DIR" .pending)"
+  requests=$((requests + runtime_requests))
+  images="$(count_matching "$SERVER_SPOOL_DIR/images" .jpg)"
+  (( requests == 0 && images == 0 )) \
+    || raise_status 1 "$SERVER_ID: $requests Auftrag/Auftraege und $images Bild(er) warten"
+done
+shopt -u nullglob
+
+(( checked > 0 )) || raise_status 1 "keine Zielserver eingerichtet"
+
+# Die Sensorik ist vom Kameraweg getrennt. Eine deaktivierte Erstkonfiguration
+# ist erlaubt. Sobald sie bewusst aktiviert wurde, sollen aber ein toter Dienst,
+# ein alter Messstand oder ein DHT22-Fehler im Gesamtcheck sichtbar werden.
+if [[ -e "$SENSOR_CONFIG" ]]; then
+  if [[ ! -x "$SENSOR_BIN" ]] \
+      || ! "$SENSOR_BIN" --check-config "$SENSOR_CONFIG" >/dev/null 2>&1; then
+    raise_status 2 "Sensor-Konfiguration ungueltig"
+  else
+    sensor_enabled="$(awk -F '=' '
+      /^[[:space:]]*(#|$)/ { next }
+      $1 ~ /^[[:space:]]*enabled[[:space:]]*$/ {
+        value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print tolower(value)
+      }
+    ' "$SENSOR_CONFIG")"
+    if [[ "$sensor_enabled" == true || "$sensor_enabled" == 1 \
+        || "$sensor_enabled" == yes || "$sensor_enabled" == on ]]; then
+      sensor_interval="$(awk -F '=' '
+        /^[[:space:]]*(#|$)/ { next }
+        $1 ~ /^[[:space:]]*sample_seconds[[:space:]]*$/ {
+          value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value
+        }
+      ' "$SENSOR_CONFIG")"
+      [[ "$sensor_interval" =~ ^[0-9]+$ ]] || sensor_interval=30
+      sensor_max_age=$((sensor_interval * 3 + 30))
+      if [[ "$TEST_MODE" != 1 ]] \
+          && ! "$SYSTEMCTL_BIN" is-active --quiet camera-rpi-sensor.service; then
+        raise_status 2 "Sensor-Dienst nicht aktiv"
+      fi
+      sensor_status="$STATUS_ROOT/current.status"
+      if [[ ! -r "$sensor_status" ]]; then
+        raise_status 2 "kein Sensorstatus"
+      else
+        sensor_state="$(status_value "$sensor_status" sensor_state)"
+        sensor_epoch="$(status_value "$sensor_status" updated_epoch)"
+        [[ "$sensor_state" == ok ]] || raise_status 1 "DHT22-Status $sensor_state"
+        now_epoch="$(date +%s)"
+        if [[ ! "$sensor_epoch" =~ ^[0-9]+$ ]] \
+            || (( now_epoch - sensor_epoch > sensor_max_age \
+              || sensor_epoch - now_epoch > 60 )); then
+          raise_status 2 "Sensorstatus zu alt"
+        fi
+      fi
+    else
+      messages+=("Sensorabfrage deaktiviert")
+    fi
+  fi
+fi
+
+if [[ "$TEST_MODE" != "1" ]]; then
+  root_options="$($FINDMNT_BIN -n -o OPTIONS -T / 2>/dev/null || true)"
+  [[ ",$root_options," == *,"$EXPECT_ROOT",* ]] \
+    || raise_status 2 "Root-Dateisystem entspricht nicht dem erwarteten Modus $EXPECT_ROOT"
+fi
+
+case "$overall" in
+  0) prefix="OK" ;;
+  1) prefix="WARNING" ;;
+  *) prefix="CRITICAL" ;;
+esac
+printf '%s - %s Konfiguration(en)' "$prefix" "$checked"
+((${#messages[@]} == 0)) || printf ' | %s' "$(IFS='; '; printf '%s' "${messages[*]}")"
+printf '\n'
+exit "$overall"

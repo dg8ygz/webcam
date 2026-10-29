@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Only fixture files and stub systemctl queries; never real services or GPIO.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+source "$PROJECT/ops/update-eos-workdir.sh"
+source "$PROJECT/ops/update-eos-legacy.sh"
+source "$PROJECT/ops/lib/legacy-install.sh"
+STAGE="$(mktemp -d /tmp/camera-eos-workdir-test.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+LI_ROOT="$STAGE/root"
+ew_paths
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+for i in "${!UE_PATHS[@]}"; do
+  install -D -m "${UE_MODES[$i]}" /dev/null "$LI_ROOT/${UE_PATHS[$i]}"
+  printf 'original-%s\n' "$i" > "$LI_ROOT/${UE_PATHS[$i]}"
+done
+mkdir -p "$LI_ROOT/etc/camera-rpi" "$LI_ROOT/var/lib/camera-rpi/spool"
+printf 'operator-config\n' > "$LI_ROOT/etc/camera-rpi/untouched.conf"
+printf 'pending-image\n' > "$LI_ROOT/var/lib/camera-rpi/spool/untouched.jpg"
+ue_snapshot "$STAGE/before"
+for i in "${!UE_PATHS[@]}"; do
+  ue_publish_file "$PROJECT/${UE_SOURCES[$i]}" "${UE_PATHS[$i]}" "${UE_MODES[$i]}"
+  expect cmp -s "$PROJECT/${UE_SOURCES[$i]}" "$LI_ROOT/${UE_PATHS[$i]}"
+done
+ue_restore "$STAGE/before" "$STAGE/after"
+for i in "${!UE_PATHS[@]}"; do
+  expect cmp -s "$STAGE/before/${UE_PATHS[$i]}" "$LI_ROOT/${UE_PATHS[$i]}"
+  expect test "$(stat -c %a "$LI_ROOT/${UE_PATHS[$i]}")" = "${UE_MODES[$i]#0}"
+done
+expect grep -qx operator-config "$LI_ROOT/etc/camera-rpi/untouched.conf"
+expect grep -qx pending-image "$LI_ROOT/var/lib/camera-rpi/spool/untouched.jpg"
+systemctl() {
+  case "$*" in
+    *ActiveState*) printf '%s\n' "${TEST_ACTIVE:-inactive}" ;;
+    *UnitFileState*) printf '%s\n' "${TEST_ENABLED:-disabled}" ;;
+    *MainPID*) printf '%s\n' "${TEST_MAIN_PID:-0}" ;;
+    *ControlPID*) printf '%s\n' "${TEST_CONTROL_PID:-0}" ;;
+    list-units*) [[ "${TEST_QUERY_FAIL:-0}" == 0 ]] || return 1
+      [[ "${TEST_OTHER:-0}" == 0 ]] || printf 'camera-rpi-worker@other.service active running\n' ;;
+    *) return 99 ;;
+  esac
+  return 0
+}
+expect ew_require_stopped
+TEST_ACTIVE=failed expect ew_require_stopped
+for fault in TEST_ACTIVE=active TEST_MAIN_PID=1234 TEST_CONTROL_PID=1235 TEST_ENABLED=enabled TEST_OTHER=1 TEST_QUERY_FAIL=1; do
+  if (export "$fault"; ew_require_stopped) >/dev/null 2>&1; then
+    printf 'FAIL: Guard akzeptiert %s\n' "$fault" >&2; exit 1
+  fi
+  ((checks+=1))
+done
+printf 'OK: %s EOS-Workdir-Update-Pruefungen; Dateirueckweg, Rechte, Daten-/Dienstschutz\n' "$checks"

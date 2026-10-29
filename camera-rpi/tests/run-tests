@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+
+# Vollstaendiger lokaler Funktionstest ohne Kamera und ohne Netzwerk.
+# Drei Worker laufen parallel, jeder mit einem anderen Server-Key.
+
+set -euo pipefail
+umask 077
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_DIR="$(cd -- "$TEST_DIR/.." && pwd -P)"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/camera-rpi-tests.XXXXXX")"
+WEB_PID=""
+cleanup() {
+  local result=$?
+  trap - EXIT HUP INT TERM
+  [[ -z "$WEB_PID" ]] || kill "$WEB_PID" 2>/dev/null || true
+  rm -rf -- "$TEMP_DIR"
+  exit "$result"
+}
+trap cleanup EXIT HUP INT TERM
+
+fail() { printf 'FEHLER: %s\n' "$*" >&2; exit 1; }
+pass() { printf 'OK: %s\n' "$*"; }
+
+bash "$TEST_DIR/install-preflight"
+bash "$TEST_DIR/update-inodes"
+php "$TEST_DIR/reboot-data.php"
+bash "$TEST_DIR/admin-key-reuse"
+bash "$TEST_DIR/admin-write-failures"
+bash "$TEST_DIR/admin-autostart"
+bash "$TEST_DIR/admin-identifiers"
+bash "$TEST_DIR/admin-logs"
+bash "$TEST_DIR/legacy-poller-guard"
+bash "$TEST_DIR/capture-recovery"
+bash "$TEST_DIR/pool-legacy-timezone"
+POOL_TEST_TIMEZONE=1 bash "$TEST_DIR/capture-pool"
+bash "$TEST_DIR/jpeg-validation"
+SOURCE_TEST_RTSP=1 bash "$TEST_DIR/capture-pool"
+php "$TEST_DIR/capture-privacy.php"
+bash "$TEST_DIR/capture-privacy-worker"
+bash "$TEST_DIR/legacy-install"
+bash "$TEST_DIR/bielefeld-legacy-config"
+bash "$TEST_DIR/legacy-target-config"
+bash "$TEST_DIR/eos-legacy"
+python3 -B "$TEST_DIR/eos-signals.py"
+bash "$TEST_DIR/eos-update"
+bash "$TEST_DIR/eos-workdir-update"
+python3 -B "$TEST_DIR/worker-lock.py"
+bash "$TEST_DIR/legacy-upload-ack"
+bash "$TEST_DIR/capture-diagnostics"
+bash "$TEST_DIR/legacy-command-frames"
+bash "$TEST_DIR/legacy-capture-stamp"
+bash "$TEST_DIR/legacy-isoexp"
+bash "$TEST_DIR/bielefeld-cutover"
+bash "$TEST_DIR/steinhagen-cutover"
+bash "$TEST_DIR/sensor-read-errors"
+bash "$TEST_DIR/sensor-retry-sequence"
+bash "$TEST_DIR/sensor-capture-resume"
+python3 -B "$TEST_DIR/test-sensor-archive.py"
+bash "$TEST_DIR/low-write-worker"
+bash "$TEST_DIR/command-timeouts"
+bash "$TEST_DIR/focus"
+bash "$TEST_DIR/focus-capabilities"
+python3 -B "$TEST_DIR/test-tunnel.py"
+python3 -B "$TEST_DIR/test-tunnel-apache.py"
+python3 -B "$TEST_DIR/test-local-weather.py"
+python3 -B "$TEST_DIR/test-command-proxy.py"
+bash "$TEST_DIR/capture-backends"
+php "$TEST_DIR/camera-source.php"
+php "$TEST_DIR/rtsp-capture-diagnostics.php"
+php "$TEST_DIR/camera-source-timeout.php"
+php "$TEST_DIR/video-stream.php"
+bash "$TEST_DIR/camera-source-apply"
+python3 -B "$TEST_DIR/test-jpeg.py"
+php "$TEST_DIR/climate-capture-race.php"
+php "$TEST_DIR/climate.php"
+php "$TEST_DIR/gpio-config.php"
+php "$TEST_DIR/gpio-board.php"
+php "$TEST_DIR/gpio-store.php"
+php "$TEST_DIR/climate-sensor-grace.php"
+php "$TEST_DIR/climate-history.php"
+php "$TEST_DIR/climate-archive.php"
+php "$TEST_DIR/dht-restore-timer.php"
+php "$TEST_DIR/dht-frame.php"
+php "$TEST_DIR/dht-counters.php"
+bash "$TEST_DIR/climate-native"
+
+chmod 0755 "$TEST_DIR/fixtures/fake-curl" "$TEST_DIR/fixtures/fake-gphoto2" \
+  "$PROJECT_DIR/scripts/camera-rpi-sensor"
+chmod 0755 "$TEST_DIR/fixtures/fake-admin-bridge"
+mkdir -p "$TEMP_DIR/etc/servers" "$TEMP_DIR/etc/keys" "$TEMP_DIR/runtime" \
+  "$TEMP_DIR/spool" "$TEMP_DIR/lock"
+
+admin_input() {
+  local id="$1"
+  local host="$2"
+  local key="$3"
+  local upload_mode="${4:-legacy}"
+  printf 'action=save\nserver_id=%s\nserver_base_url=http://%s/webcam\ncamera_slug=bielefeld\nenabled=true\nupload_mode=%s\nkey_mode=replace\nkey=%s\n' \
+    "$id" "$host" "$upload_mode" "$key" |
+    CAMERA_RPI_ADMIN_TEST_MODE=1 \
+    CAMERA_RPI_CONFIG_DIR="$TEMP_DIR/etc/servers" \
+    CAMERA_RPI_KEY_DIR="$TEMP_DIR/etc/keys" \
+    CAMERA_RPI_RUNTIME_ROOT="$TEMP_DIR/runtime" \
+    CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/admin.lock" \
+    CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/admin/camera-rpi-admin" >/dev/null
+}
+
+admin_input server-one server-one.invalid key-one-111111 chunked
+admin_input server-two server-two.invalid key-two-222222 chunked
+admin_input server-three server-three.invalid key-three-333333
+pass "Admin-Bruecke speichert drei Zielserver und getrennte Key-Dateien"
+
+for id in server-one server-two server-three; do
+  config="$TEMP_DIR/etc/servers/$id.conf"
+  sed -i \
+    -e 's|^manage_root_mount=.*|manage_root_mount=0|' \
+    -e "s|^spool_root=.*|spool_root=$TEMP_DIR/spool|" \
+    -e "s|^runtime_root=.*|runtime_root=$TEMP_DIR/runtime|" \
+    "$config"
+done
+
+list_output="$(printf 'action=list\n' |
+  CAMERA_RPI_ADMIN_TEST_MODE=1 \
+  CAMERA_RPI_CONFIG_DIR="$TEMP_DIR/etc/servers" \
+  CAMERA_RPI_KEY_DIR="$TEMP_DIR/etc/keys" \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/admin/camera-rpi-admin")"
+[[ "$(printf '%s\n' "$list_output" | tail -n +2 | wc -l)" -eq 3 ]] \
+  || fail "Admin-Liste enthaelt nicht drei Server"
+for secret in key-one-111111 key-two-222222 key-three-333333; do
+  [[ "$list_output" != *"$secret"* ]] || fail "Admin-Liste verraet einen Key"
+done
+pass "Admin-Ausgabe zeigt keinen Key"
+
+# Leeres Passwort bei einem bestehenden Ziel: Inhalt UND Inode bleiben gleich.
+key_before="$(stat -c '%i:%Y:%s' "$TEMP_DIR/etc/keys/server-one.key")"
+key_hash="$(sha256sum "$TEMP_DIR/etc/keys/server-one.key")"
+printf 'action=save\nserver_id=server-one\nserver_base_url=http://server-one.invalid/webcam\ncamera_slug=bielefeld\nkey_mode=keep\nkey=\n' |
+  CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_CONFIG_DIR="$TEMP_DIR/etc/servers" \
+  CAMERA_RPI_KEY_DIR="$TEMP_DIR/etc/keys" CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/admin.lock" \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/admin/camera-rpi-admin" >/dev/null
+[[ "$key_before" == "$(stat -c '%i:%Y:%s' "$TEMP_DIR/etc/keys/server-one.key")" \
+  && "$key_hash" == "$(sha256sum "$TEMP_DIR/etc/keys/server-one.key")" ]] || fail 'Leeres Passwort hat Key veraendert'
+grep -qx 'upload_mode=chunked' "$TEMP_DIR/etc/servers/server-one.conf" || fail 'Bestehende Werte verloren'
+pass 'Leerer Schluessel erhaelt Key-Datei unveraendert und bestehende Einstellungen'
+
+# PHP wird mit einer kopierten Bootstrap-Datei gegen eine harmlose Testbruecke
+# gestartet. So lassen sich HTML-Escaping, Browser-Schutzheader, Sitzung und
+# ein echter CSRF-geschuetzter POST testen, ohne etwas zu installieren.
+mkdir -p "$TEMP_DIR/web/public" "$TEMP_DIR/web/src"
+cp "$PROJECT_DIR/VERSION" "$TEMP_DIR/VERSION"
+cp "$PROJECT_DIR/admin/public/source.js" "$PROJECT_DIR/admin/public/index.php" "$PROJECT_DIR/admin/public/style.css" "$TEMP_DIR/web/public/"
+# Keep release metadata inside the fixture as well, never use host-installed UI.
+sed -i "s|/usr/local/share/doc/camera-rpi/VERSION|$TEMP_DIR/VERSION|" "$TEMP_DIR/web/public/index.php"
+cp "$PROJECT_DIR/admin/src/bootstrap.php" "$TEMP_DIR/web/src/"
+cp "$PROJECT_DIR/admin/src/source-panel.php" "$PROJECT_DIR/admin/src/climate.php" "$PROJECT_DIR/admin/src/climate-panel.php" "$TEMP_DIR/web/src/"
+sed -i "s|'/usr/local/sbin/camera-rpi-admin'|'$TEST_DIR/fixtures/fake-admin-bridge'|" \
+  "$TEMP_DIR/web/src/bootstrap.php"
+mkdir -p "$TEMP_DIR/web-sessions"
+chmod 0700 "$TEMP_DIR/web-sessions"
+sed -i "s|'/run/camera-rpi-admin/sessions'|'$TEMP_DIR/web-sessions'|" \
+  "$TEMP_DIR/web/src/bootstrap.php"
+web_port="$((20000 + $$ % 20000))"
+php -S "127.0.0.1:$web_port" -t "$TEMP_DIR/web/public" \
+  "$TEST_DIR/fixtures/php-router.php" >"$TEMP_DIR/php-server.log" 2>&1 &
+WEB_PID="$!"
+for unused in {1..100}; do
+  curl --silent --output /dev/null "http://127.0.0.1:$web_port/index.php" && break
+  sleep 0.02
+done
+curl --silent --show-error --dump-header "$TEMP_DIR/web.headers" \
+  --cookie-jar "$TEMP_DIR/web.cookies" --output "$TEMP_DIR/web.html" \
+  "http://127.0.0.1:$web_port/index.php"
+grep -Eqi '^Content-Security-Policy:' "$TEMP_DIR/web.headers" \
+  || fail "Admin-Webseite sendet keine Content-Security-Policy"
+grep -Eqi '^X-Frame-Options:[[:space:]]*DENY' "$TEMP_DIR/web.headers" \
+  || fail "Admin-Webseite besitzt keinen Frame-Schutz"
+grep -Fq '&lt;script&gt;nicht ausfuehren&lt;/script&gt;' "$TEMP_DIR/web.html" \
+  || fail "Admin-Webseite escaped Statustext nicht"
+! grep -Fq '<script>nicht ausfuehren</script>' "$TEMP_DIR/web.html" \
+  || fail "Admin-Webseite gab fremdes HTML roh aus"
+csrf="$(sed -n 's/.*name="csrf" value="\([0-9a-f]*\)".*/\1/p' "$TEMP_DIR/web.html" | head -n 1)"
+[[ ${#csrf} -eq 64 ]] || fail "Admin-Webseite lieferte keinen gueltigen CSRF-Token"
+post_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  --cookie "$TEMP_DIR/web.cookies" \
+  --data-urlencode "csrf=$csrf" --data-urlencode 'action=save' \
+  --data-urlencode 'server_id=web-neu' \
+  --data-urlencode 'server_base_url=https://neu.invalid/webcam' \
+  --data-urlencode 'camera_slug=bielefeld' \
+  --data-urlencode 'upload_mode=chunked' \
+  --data-urlencode 'capture_backend=v4l2' \
+  --data-urlencode 'video_device=/dev/video0' \
+  --data-urlencode 'video_width=1920' --data-urlencode 'video_height=1080' \
+  --data-urlencode 'video_warmup_frames=15' \
+  --data-urlencode 'enabled=on' --data-urlencode 'key=web-test-key-4444' \
+  "http://127.0.0.1:$web_port/index.php")"
+[[ "$post_code" == "303" ]] || fail "Admin-POST endete nicht mit sicherem Redirect"
+curl --silent --show-error --cookie "$TEMP_DIR/web.cookies" \
+  "http://127.0.0.1:$web_port/index.php?edit=web-test" > "$TEMP_DIR/web-edited.html"
+grep -q 'Server web-neu wurde gespeichert' "$TEMP_DIR/web-edited.html" \
+  || fail "Admin-POST hat die V4L2-Felder nicht an die Bruecke uebergeben"
+grep -q 'value="v4l2" selected' "$TEMP_DIR/web-edited.html" \
+  || fail "V4L2-Auswahl beim Bearbeiten verloren"
+curl --silent --show-error --output /dev/null --cookie "$TEMP_DIR/web.cookies" \
+  --data-urlencode "csrf=$csrf" --data-urlencode action=save --data-urlencode server_id=web-test \
+  --data-urlencode server_base_url=https://server.invalid/webcam --data-urlencode camera_slug=bielefeld \
+  --data-urlencode upload_mode=chunked --data-urlencode capture_backend=v4l2 \
+  --data-urlencode video_device=/dev/video0 --data-urlencode video_width=1920 \
+  --data-urlencode video_height=1080 --data-urlencode video_warmup_frames=15 --data-urlencode key= \
+  "http://127.0.0.1:$web_port/index.php"
+curl --silent --show-error --cookie "$TEMP_DIR/web.cookies" --output "$TEMP_DIR/key-kept.html" "http://127.0.0.1:$web_port/index.php"
+grep -q 'Server web-test wurde gespeichert' "$TEMP_DIR/key-kept.html" || fail 'Leerer Key im HTTP-Formular nicht als keep uebergeben'
+curl --silent --show-error --output /dev/null --cookie "$TEMP_DIR/web.cookies" \
+  --data-urlencode "csrf=$csrf" --data-urlencode action=capture --data-urlencode server_id=web-test \
+  "http://127.0.0.1:$web_port/index.php"
+curl --silent --show-error --cookie "$TEMP_DIR/web.cookies" --output "$TEMP_DIR/manual-post.html" "http://127.0.0.1:$web_port/index.php"
+grep -q 'Aufnahme für web-test vorgemerkt' "$TEMP_DIR/manual-post.html" || fail 'Manueller Capture-POST scheitert'
+curl --silent --show-error --output /dev/null --cookie "$TEMP_DIR/web.cookies" \
+  --data-urlencode csrf=invalid --data-urlencode action=capture --data-urlencode server_id=web-test \
+  "http://127.0.0.1:$web_port/index.php"
+curl --silent --show-error --cookie "$TEMP_DIR/web.cookies" --output "$TEMP_DIR/manual-invalid.html" "http://127.0.0.1:$web_port/index.php"
+grep -q 'Formular ist abgelaufen' "$TEMP_DIR/manual-invalid.html" || fail 'Capture akzeptiert falsches CSRF'
+curl --silent --show-error --output /dev/null --cookie "$TEMP_DIR/web.cookies" \
+  --data-urlencode "csrf=$csrf" --data-urlencode action=logs --data-urlencode server_id=web-test \
+  "http://127.0.0.1:$web_port/index.php"
+curl --silent --show-error --cookie "$TEMP_DIR/web.cookies" --output "$TEMP_DIR/journal.html" "http://127.0.0.1:$web_port/index.php"
+grep -q '&lt;script&gt;journal-must-not-execute&lt;/script&gt;' "$TEMP_DIR/journal.html" || fail 'Journal fehlt oder wird nicht HTML-escaped'
+! grep -q '<script>journal-must-not-execute' "$TEMP_DIR/journal.html" || fail 'Journal-XSS'
+if [[ -n "${CAMERA_RPI_UI_ARTIFACT_DIR:-}" ]]; then
+  mkdir -p "$CAMERA_RPI_UI_ARTIFACT_DIR"
+  cp "$TEMP_DIR/web.html" "$CAMERA_RPI_UI_ARTIFACT_DIR/admin.html"
+  curl --silent --show-error --cookie "$TEMP_DIR/web.cookies" \
+    "http://127.0.0.1:$web_port/index.php?new=1" > "$CAMERA_RPI_UI_ARTIFACT_DIR/admin-new.html"
+  cp "$PROJECT_DIR/admin/public/style.css" "$CAMERA_RPI_UI_ARTIFACT_DIR/admin.css"
+fi
+kill "$WEB_PID" 2>/dev/null || true
+wait "$WEB_PID" 2>/dev/null || true
+WEB_PID=""
+pass "Admin-Webseite rendert sicher und akzeptiert nur CSRF-geschuetzten POST"
+
+# Eine fremde Konfigurationszeile darf niemals als Shellcode interpretiert
+# werden. Der Check muss sie schlicht ablehnen.
+cp "$TEMP_DIR/etc/servers/server-one.conf" "$TEMP_DIR/bad.conf"
+printf 'shell_command=touch /tmp/darf-nicht-passieren\n' >> "$TEMP_DIR/bad.conf"
+if CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/camera-rpi-worker" --check-config "$TEMP_DIR/bad.conf" >/dev/null 2>&1; then
+  fail "Unbekannte Konfigurationszeile wurde akzeptiert"
+fi
+pass "Konfiguration ist Datenformat und kein Shellprogramm"
+
+# Der Sensor wird mit normalen Testdateien statt GPIO/IIO betrieben. Damit
+# pruefen wir Messskalierung, Heizungsrueckmeldung, echte Luefterdrehzahl und
+# den Verlauf, ohne auf dem Entwicklungsserver Hardware vorauszusetzen.
+mkdir -p "$TEMP_DIR/status" "$TEMP_DIR/sensor"
+printf '23400\n' > "$TEMP_DIR/sensor/temperature"
+printf '56100\n' > "$TEMP_DIR/sensor/humidity"
+printf '1\n' > "$TEMP_DIR/sensor/heater"
+printf '128\n' > "$TEMP_DIR/sensor/fan-percent"
+printf '1400\n' > "$TEMP_DIR/sensor/fan-rpm"
+printf '%s\n' \
+  'enabled=true' \
+  'sample_seconds=30' \
+  'history_hours=24' \
+  'dht_iio_device=auto' \
+  "temperature_file=$TEMP_DIR/sensor/temperature" \
+  "humidity_file=$TEMP_DIR/sensor/humidity" \
+  'temperature_scale=1000' \
+  'humidity_scale=1000' \
+  "heater_state_file=$TEMP_DIR/sensor/heater" \
+  'heater_active_value=1' \
+  "fan_percent_file=$TEMP_DIR/sensor/fan-percent" \
+  'fan_percent_max=255' \
+  "fan_rpm_file=$TEMP_DIR/sensor/fan-rpm" \
+  'fan_running_file=' \
+  'fan_running_active_value=1' > "$TEMP_DIR/device.conf"
+CAMERA_RPI_SENSOR_TEST_MODE=1 CAMERA_RPI_STATUS_ROOT="$TEMP_DIR/status" CAMERA_RPI_STATUS_GROUP='' \
+  "$PROJECT_DIR/scripts/camera-rpi-sensor" --check-config "$TEMP_DIR/device.conf" >/dev/null
+CAMERA_RPI_SENSOR_TEST_MODE=1 CAMERA_RPI_STATUS_ROOT="$TEMP_DIR/status" CAMERA_RPI_STATUS_GROUP='' \
+  "$PROJECT_DIR/scripts/camera-rpi-sensor" --once "$TEMP_DIR/device.conf"
+# History deduplicates timestamps; these must represent two different seconds.
+sleep 1
+printf '24100\n' > "$TEMP_DIR/sensor/temperature"
+CAMERA_RPI_SENSOR_TEST_MODE=1 CAMERA_RPI_STATUS_ROOT="$TEMP_DIR/status" CAMERA_RPI_STATUS_GROUP='' \
+  "$PROJECT_DIR/scripts/camera-rpi-sensor" --once "$TEMP_DIR/device.conf"
+grep -qx 'sensor_state=ok' "$TEMP_DIR/status/current.status" \
+  || fail "Simulierter DHT22 meldet keinen gesunden Zustand"
+grep -qx 'temperature_c=24.1' "$TEMP_DIR/status/current.status" \
+  || fail "DHT22-Temperatur wurde nicht richtig skaliert"
+grep -qx 'humidity_percent=56.1' "$TEMP_DIR/status/current.status" \
+  || fail "DHT22-Luftfeuchte wurde nicht richtig skaliert"
+grep -qx 'heater_state=on' "$TEMP_DIR/status/current.status" \
+  || fail "Heizungsrueckmeldung wurde nicht erkannt"
+grep -qx 'fan_state=running' "$TEMP_DIR/status/current.status" \
+  || fail "Luefterdrehung wurde nicht erkannt"
+grep -qx 'fan_percent=50' "$TEMP_DIR/status/current.status" \
+  || fail "Luefter-PWM wurde nicht in Prozent umgerechnet"
+[[ "$(wc -l < "$TEMP_DIR/status/history.tsv")" -eq 2 ]] \
+  || fail "Sensorverlauf enthaelt nicht beide Messungen"
+pass "DHT22, Heizung und Luefter werden getrennt gelesen und im RAM protokolliert"
+
+# The synthetic gphoto executable implements direct capture only. Explicitly
+# select that alternative; the production default remains EOS event capture.
+for id in server-one server-two server-three; do
+  sed -i '/^gphoto_capture_mode=/d' "$TEMP_DIR/etc/servers/$id.conf"
+  printf '\ngphoto_capture_mode=standard\n' >> "$TEMP_DIR/etc/servers/$id.conf"
+done
+export FAKE_CURL_ARGUMENT_LOG="$TEMP_DIR/curl-arguments.log"
+export FAKE_UPLOAD_LOG="$TEMP_DIR/uploads.log"
+export FAKE_GPHOTO_LOG="$TEMP_DIR/gphoto.log"
+export FAKE_CAMERA_ACTIVE="$TEMP_DIR/camera-active"
+export FAKE_CAMERA_OVERLAP_LOG="$TEMP_DIR/overlap.log"
+export FAKE_CAPTURE_SERIAL="$(date +%s)"
+export FAKE_CHUNK_SUPPORT_HOST="server-one.invalid"
+export CAMERA_RPI_STATUS_ROOT="$TEMP_DIR/status"
+export CAMERA_RPI_STATUS_GROUP=""
+: > "$FAKE_CURL_ARGUMENT_LOG"
+: > "$FAKE_UPLOAD_LOG"
+: > "$FAKE_GPHOTO_LOG"
+: > "$FAKE_CAMERA_OVERLAP_LOG"
+
+pids=()
+for id in server-one server-two server-three; do
+  CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+  CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+  CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+    "$TEMP_DIR/etc/servers/$id.conf" >"$TEMP_DIR/$id.log" 2>&1 &
+  pids+=("$!")
+done
+for pid in "${pids[@]}"; do wait "$pid" || fail "Ein Worker-Durchlauf ist fehlgeschlagen"; done
+
+[[ ! -s "$FAKE_CAMERA_OVERLAP_LOG" ]] || fail "Globale Kamera-Sperre hat Parallelzugriff zugelassen"
+[[ "$(grep -c $'\tstart$' "$FAKE_GPHOTO_LOG")" -eq 3 ]] || fail "Es gab nicht drei Aufnahmen"
+[[ "$(wc -l < "$FAKE_UPLOAD_LOG")" -eq 3 ]] || fail "Es gab nicht drei bestaetigte Uploads"
+pass "Drei Server arbeiten parallel, die einzelne Kamera bleibt serialisiert"
+
+[[ -s "$TEMP_DIR/status/latest.jpg" ]] \
+  || fail "Worker stellte kein letztes Bild fuer die Statusseite bereit"
+grep -Eq '^captured_epoch=[0-9]{10}$' "$TEMP_DIR/status/latest.status" \
+  || fail "Tatsaechliche Aufnahmezeit fehlt in der lokalen Bildmetadatei"
+pass "Worker veroeffentlicht letztes Bild und tatsaechliche Aufnahmezeit atomar im RAM"
+
+# Die lokale Seite wird mit echten, soeben erzeugten Laufzeitdateien gerendert.
+# Sie muss Werte escapen, das JPEG separat ausliefern und eine SVG-Grafik aus
+# den beiden Sensorpunkten aufbauen.
+mkdir -p "$TEMP_DIR/status-web"
+cp "$PROJECT_DIR/status/public/index.php" "$PROJECT_DIR/status/public/style.css" \
+  "$TEMP_DIR/status-web/"
+sed -i "s|/usr/local/share/doc/camera-rpi/VERSION|$TEMP_DIR/VERSION|" "$TEMP_DIR/status-web/index.php"
+status_port="$((web_port + 1))"
+CAMERA_RPI_STATUS_ROOT="$TEMP_DIR/status" php -S "127.0.0.1:$status_port" \
+  -t "$TEMP_DIR/status-web" >"$TEMP_DIR/status-php-server.log" 2>&1 &
+WEB_PID="$!"
+for unused in {1..100}; do
+  curl --silent --output /dev/null "http://127.0.0.1:$status_port/index.php" && break
+  sleep 0.02
+done
+curl --silent --show-error --dump-header "$TEMP_DIR/status.headers" \
+  --output "$TEMP_DIR/status.html" "http://127.0.0.1:$status_port/index.php"
+grep -Eqi '^Content-Security-Policy:' "$TEMP_DIR/status.headers" \
+  || fail "Statusseite sendet keine Content-Security-Policy"
+grep -Fq '24,1 °C' "$TEMP_DIR/status.html" \
+  || fail "Statusseite zeigt die DHT22-Temperatur nicht"
+if grep -Eq 'class="cards"|Heizung ist eingeschaltet\.|Luefter dreht mit 1400' "$TEMP_DIR/status.html"; then
+  fail "Statusseite zeigt noch die entfernten doppelten Geraetekacheln"
+fi
+grep -Fq 'climate-overview' "$TEMP_DIR/status.html" \
+  || fail "Statusseite zeigt die beibehaltene Regler-Tabelle nicht"
+grep -Fq '<polyline class="temperature-line" points="' "$TEMP_DIR/status.html" \
+  || fail "Statusseite erzeugt keine Temperatur-Verlaufsgrafik"
+image_code="$(curl --silent --show-error --output "$TEMP_DIR/status-image.jpg" \
+  --write-out '%{http_code}' "http://127.0.0.1:$status_port/index.php?asset=latest-image")"
+[[ "$image_code" == 200 ]] || fail "Statusseite liefert das letzte Bild nicht aus"
+cmp "$TEMP_DIR/status/latest.jpg" "$TEMP_DIR/status-image.jpg" >/dev/null \
+  || fail "Statusseite veraenderte das letzte Kamerabild"
+kill "$WEB_PID" 2>/dev/null || true
+wait "$WEB_PID" 2>/dev/null || true
+WEB_PID=""
+pass "Lokale Webseite zeigt Bildzeit, Messwerte, Geraetestatus und Verlaufsgrafik"
+if [[ -n "${CAMERA_RPI_UI_ARTIFACT_DIR:-}" ]]; then
+  cp "$TEMP_DIR/status.html" "$CAMERA_RPI_UI_ARTIFACT_DIR/status.html"
+  cp "$PROJECT_DIR/status/public/style.css" "$CAMERA_RPI_UI_ARTIFACT_DIR/status.css"
+  cp "$TEMP_DIR/status-image.jpg" "$CAMERA_RPI_UI_ARTIFACT_DIR/latest.jpg"
+fi
+
+grep -Fq 'server-one.invalid/webcam/include/upload-chunk.php' "$FAKE_CURL_ARGUMENT_LOG" \
+  || fail "Server eins wurde trotz Chunk-Konfiguration nicht per Chunk-v1 angesprochen"
+! grep -F 'server-one.invalid/webcam/include/upload.php' "$FAKE_CURL_ARGUMENT_LOG" >/dev/null \
+  || fail "Server eins fiel trotz bestaetigtem Chunk-v1 auf Legacy zurueck"
+grep -Fq 'server-two.invalid/webcam/include/upload-chunk.php' "$FAKE_CURL_ARGUMENT_LOG" \
+  || fail "Server zwei pruefte Chunk-v1 nicht"
+grep -Fq 'server-two.invalid/webcam/include/upload.php' "$FAKE_CURL_ARGUMENT_LOG" \
+  || fail "Server zwei nutzte nach fehlender Chunk-Unterstuetzung kein Legacy"
+! grep -F 'server-three.invalid/webcam/include/upload-chunk.php' "$FAKE_CURL_ARGUMENT_LOG" >/dev/null \
+  || fail "Legacy-Server drei fuehrte unnoetig eine Chunk-Pruefung aus"
+pass "Chunk-v1 wird ausgehandelt; alte Gegenstellen erhalten automatisch Legacy"
+
+for secret in key-one-111111 key-two-222222 key-three-333333; do
+  ! grep -Fq "$secret" "$FAKE_CURL_ARGUMENT_LOG" || fail "Key stand in Curl-Prozessargumenten"
+done
+pass "Keys stehen nicht in Curl-Prozessargumenten"
+
+if find "$TEMP_DIR/spool" -type f -print -quit | grep -q .; then
+  fail "Nach bestaetigten Uploads blieb etwas im Spool"
+fi
+pass "Bilder werden erst nach Serverbestaetigung geloescht"
+
+# Dies ist die echte Warteantwort der vorhandenen command.php. Sie darf weder
+# als Fehler gelten noch versehentlich eine vierte Aufnahme ausloesen.
+FAKE_COMMAND_MODE=wait \
+  CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+  CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+  CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+  "$TEMP_DIR/etc/servers/server-one.conf" >/dev/null 2>&1
+[[ "$(grep -c $'\tstart$' "$FAKE_GPHOTO_LOG")" -eq 3 ]] \
+  || fail "wait/0/wait hat eine Kameraaufnahme ausgeloest"
+pass "Produktive wait/0/wait-Antwort wird korrekt erkannt"
+
+# Ein langsamer Upload von Server eins darf die inzwischen freie Kamera nicht
+# fuer Server zwei blockieren.
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+export FAKE_SLOW_UPLOAD_HOST="server-one.invalid"
+export FAKE_SLOW_UPLOAD_MARKER="$TEMP_DIR/slow-upload.active"
+export FAKE_SLOW_UPLOAD_RELEASE="$TEMP_DIR/slow-upload.release"
+export FAKE_CAPTURE_DURING_UPLOAD_LOG="$TEMP_DIR/capture-during-upload.log"
+: > "$FAKE_CAPTURE_DURING_UPLOAD_LOG"
+CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+  "$TEMP_DIR/etc/servers/server-one.conf" >/dev/null 2>&1 &
+slow_pid="$!"
+for unused in {1..100}; do
+  [[ -e "$FAKE_SLOW_UPLOAD_MARKER" ]] && break
+  sleep 0.02
+done
+[[ -e "$FAKE_SLOW_UPLOAD_MARKER" ]] || fail "Langsamer Testupload startete nicht"
+CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+  "$TEMP_DIR/etc/servers/server-two.conf" >/dev/null 2>&1
+: > "$FAKE_SLOW_UPLOAD_RELEASE"
+wait "$slow_pid"
+[[ -s "$FAKE_CAPTURE_DURING_UPLOAD_LOG" ]] \
+  || fail "Langsamer Upload hielt die Kamera fuer andere Server fest"
+unset FAKE_SLOW_UPLOAD_HOST FAKE_SLOW_UPLOAD_MARKER FAKE_SLOW_UPLOAD_RELEASE FAKE_CAPTURE_DURING_UPLOAD_LOG
+pass "Langsamer Zielserver blockiert keine Kameraaufnahme anderer Server"
+
+# Auch ein harter GPhoto-Fehler muss Kamera- und Prozesssperre freigeben. Der
+# vorgemerkte Request wird im direkt folgenden Lauf erfolgreich nachgeholt.
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+if FAKE_GPHOTO_FAIL=1 \
+    CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+    CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+    CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+    CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+    "$TEMP_DIR/etc/servers/server-three.conf" >/dev/null 2>&1; then
+  fail "Simulierter GPhoto-Fehler wurde als Erfolg gemeldet"
+fi
+[[ -f "$TEMP_DIR/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] \
+  || fail "GPhoto-Fehler verlor den persistenten Request"
+FAKE_COMMAND_MODE=wait \
+  CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+  CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+  CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+  "$TEMP_DIR/etc/servers/server-three.conf" >/dev/null 2>&1
+[[ ! -e "$FAKE_CAMERA_ACTIVE" ]] || fail "Kamera-Sperrmarker blieb nach Fehler liegen"
+[[ ! -e "$TEMP_DIR/spool/server-three/requests/$FAKE_CAPTURE_SERIAL.request" ]] \
+  || fail "Request wurde nach Kamerawiederkehr nicht erledigt"
+pass "GPhoto-Fehler behaelt Auftrag und gibt alle Sperren fuer Retry frei"
+
+health_output="$(CAMERA_RPI_CONFIG_DIR="$TEMP_DIR/etc/servers" \
+  CAMERA_RPI_HEALTH_TEST_MODE=1 \
+  CAMERA_RPI_SENSOR_CONFIG="$TEMP_DIR/device.conf" \
+  CAMERA_RPI_SENSOR_BIN="$PROJECT_DIR/scripts/camera-rpi-sensor" \
+  CAMERA_RPI_STATUS_ROOT="$TEMP_DIR/status" \
+  CAMERA_RPI_STATUS_GROUP='' \
+  CAMERA_RPI_SENSOR_TEST_MODE=1 \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/camera-rpi-healthcheck")"
+[[ "$health_output" == OK\ * ]] || fail "Healthcheck meldet nach Erfolg nicht OK: $health_output"
+pass "Healthcheck erkennt drei gesunde Worker- und Sensorzustaende"
+
+manual_request() {
+  printf 'action=capture\nserver_id=%s\n' "$1" |
+    CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_CONFIG_DIR="$TEMP_DIR/etc/servers" \
+    CAMERA_RPI_KEY_DIR="$TEMP_DIR/etc/keys" \
+    CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/admin/camera-rpi-admin"
+}
+manual_request server-two >/dev/null
+[[ -f "$TEMP_DIR/runtime/server-two/manual.request" ]] || fail 'Manueller Auftrag fehlt'
+[[ ! -e "$TEMP_DIR/runtime/server-one/manual.request" && ! -e "$TEMP_DIR/runtime/server-three/manual.request" ]] || fail 'Fremdes Ziel ausgeloest'
+if manual_request server-two >/dev/null 2>&1; then fail 'Doppelklick akzeptiert'; fi
+if manual_request ../server-two >/dev/null 2>&1; then fail 'Pfadmanipulation akzeptiert'; fi
+if manual_request missing >/dev/null 2>&1; then fail 'Unbekanntes Ziel akzeptiert'; fi
+before_uploads="$(wc -l < "$FAKE_UPLOAD_LOG")"
+FAKE_COMMAND_MODE=wait CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+  CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+  CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+  CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+  "$PROJECT_DIR/scripts/camera-rpi-worker" --once "$TEMP_DIR/etc/servers/server-two.conf" >/dev/null 2>&1
+[[ "$(wc -l < "$FAKE_UPLOAD_LOG")" -eq $((before_uploads + 1)) ]] || fail 'Manuelle Aufnahme fehlt/doppelt'
+tail -n 1 "$FAKE_UPLOAD_LOG" | grep -q 'server-two.invalid' || fail 'Manuelles Bild an falsches Ziel'
+[[ ! -e "$TEMP_DIR/runtime/server-two/manual.request" ]] || fail 'Auftrag blieb nach Aufnahme offen'
+if manual_request server-two >/dev/null 2>&1; then fail '30-Sekunden-Pause fehlt'; fi
+pass 'Manuelle Aufnahme nur fuer ein Ziel; Doppelklick, Pause und Pfadschutz geprueft'
+
+mode_worker() {
+  FAKE_SERVER_UPLOAD_MODE="$1" CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+    CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+    CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+    CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/camera-rpi-worker" --once "$TEMP_DIR/etc/servers/$2.conf" >/dev/null 2>&1
+}
+for override in legacy chunked local ''; do
+  export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+  FAKE_CHUNK_SUPPORT_HOST=server-two.invalid mode_worker "$override" server-two || fail 'Zentrale Upload-Auswahl fehlgeschlagen'
+  expected=chunked; [[ "$override" != legacy ]] || expected=legacy
+  grep -qx "effective_upload_mode=$expected" "$TEMP_DIR/runtime/server-two/status" || fail 'Falsche wirksame Vorgabe'
+  if [[ "$expected" == chunked ]]; then
+    tail -n 1 "$FAKE_UPLOAD_LOG" | grep -q 'upload-chunk.php' || fail 'Chunk-Vorgabe nicht angewendet'
+  else
+    tail -n 1 "$FAKE_UPLOAD_LOG" | grep -q '/upload.php' || fail 'Legacy-Vorgabe nicht angewendet'
+  fi
+done
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+FAKE_CHUNK_SUPPORT_HOST=server-three.invalid mode_worker chunked server-three || fail 'Remote Chunk bei lokalem Legacy fehlt'
+grep -qx 'upload_mode=legacy' "$TEMP_DIR/etc/servers/server-three.conf" || fail 'Remote hat lokale Config geaendert'
+for invalid in shell $'chunked\r\nX-Camera-Upload-Mode: legacy'; do
+  if mode_worker "$invalid" server-two; then fail 'Ungueltige/doppelte Upload-Vorgabe akzeptiert'; fi
+done
+grep -qx 'chunked' "$TEMP_DIR/runtime/server-three/upload-mode" || fail 'Fremdes Ziel wurde umgestellt'
+pass 'Zentrale Legacy/Chunk/Local-Vorgabe, alte Server und Zieltrennung geprueft'
+
+# Ein abgelehnter Upload muss fehlschlagen und sein JPEG behalten. Dies ist
+# der wichtigste Schutz gegen Bildverlust bei einem Serverausfall.
+export FAKE_CAPTURE_SERIAL="$((FAKE_CAPTURE_SERIAL + 1))"
+export FAKE_FAIL_UPLOAD_HOST="server-one.invalid"
+if CAMERA_RPI_CURL_BIN="$TEST_DIR/fixtures/fake-curl" \
+    CAMERA_RPI_GPHOTO_BIN="$TEST_DIR/fixtures/fake-gphoto2" \
+    CAMERA_RPI_OPERATION_LOCK="$TEMP_DIR/lock/camera.lock" \
+    CAMERA_RPI_COMMON_LIB="$PROJECT_DIR/scripts/lib/camera-rpi-common.sh" \
+    "$PROJECT_DIR/scripts/camera-rpi-worker" --once \
+    "$TEMP_DIR/etc/servers/server-one.conf" >/dev/null 2>&1; then
+  fail "Worker meldete einen abgelehnten Upload als Erfolg"
+fi
+[[ -f "$TEMP_DIR/spool/server-one/images/$FAKE_CAPTURE_SERIAL.jpg" ]] \
+  || fail "Abgelehnter Upload hat sein JPEG verloren"
+pass "Serverfehler behaelt das fertige JPEG fuer den naechsten Versuch"
+
+printf 'Alle Camera-RPi-Tests erfolgreich.\n'

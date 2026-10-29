@@ -1,0 +1,12 @@
+{
+  "mode": "off",
+  "dew_margin_c": 5.0,
+  "hysteresis_c": 1.0,
+  "off_delay_seconds": 60,
+  "summer_c": 30.0,
+  "summer_fan_percent": 75,
+  "fan_min_percent": 30,
+  "fan_max_percent": 100,
+  "sensor_max_age_seconds": 120,
+  "average_samples": 7
+}

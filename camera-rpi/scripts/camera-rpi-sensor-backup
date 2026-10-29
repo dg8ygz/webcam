@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Serialize the SD write window with capture/admin operations, including RO Pis.
+set -euo pipefail
+umask 077
+[[ "$EUID" == 0 ]] || exit 1
+exec 9>/run/lock/camera-rpi.operation.lock
+flock -w 120 9
+ROOT_RW_OWNED=0
+finish() {
+  # Restore RO only if this invocation changed it; retain a failure exit on remount error.
+  local result=$?
+  trap - EXIT
+  if (( ROOT_RW_OWNED )); then
+    sync
+    if ! mount -o remount,ro /; then
+      printf 'KRITISCH: Root nach Sensorbackup nicht wieder RO.\n' >&2
+      result=1
+    fi
+  fi
+  exit "$result"
+}
+trap finish EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+options="$(findmnt -n -o OPTIONS -T /)"
+if [[ ",$options," == *,ro,* ]]; then
+  mount -o remount,rw /
+  ROOT_RW_OWNED=1
+fi
+# Both snapshots share this single daily RO/RW window. Attempt the second even
+# if the first fails, but return failure to systemd if either archive failed.
+result=0
+/usr/bin/python3 -B /usr/local/libexec/camera-rpi-sensor-archive.py backup || result=1
+if [[ -f /usr/local/libexec/camera-rpi-climate-archive.php ]]; then
+  /usr/bin/php -d opcache.enable_cli=0 -d opcache.file_cache= /usr/local/libexec/camera-rpi-climate-archive.php backup || result=1
+fi
+exit "$result"

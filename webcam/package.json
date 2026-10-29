@@ -1,0 +1,33 @@
+{
+  "dependencies": {
+    "playwright": "^1.49.1"
+  },
+  "scripts": {
+    "test:e2e:isolated": "node bin/test_e2e_isolated.cjs",
+    "test:e2e-bestof": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome node tests/e2e/bestof-toggle.test.js",
+    "test:e2e-bestof-archive": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome node tests/e2e/bestof-toggle-archive.test.js",
+    "test:e2e-timelapse": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/timelapse.smoke.test.js",
+    "test:e2e-timelapse-menu": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/timelapse.menu.test.js",
+    "test:e2e-admin-scripts": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/admin.scripts.workspace.test.js",
+    "test:e2e-global-bestof": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/global.bestof.test.js",
+    "test:e2e-history": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/history.smoke.test.js",
+    "test:e2e-topbar": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/topbar.dropdown.test.js",
+    "test:e2e-timeline-nav": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/timeline.nav.test.js",
+    "test:e2e-hotspot-like": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/hotspot.like.smoke.test.js",
+    "test:e2e-bestof-grid": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/bestof.grid.test.js",
+    "test:e2e-bestof-nodate": "PLAYWRIGHT_BROWSERS_PATH=.npmhome/ms-playwright HOME=.npmhome npx playwright test tests/e2e/bestof.nodate.test.js",
+    "test:all": "bash bin/test_all.sh"
+  },
+  "name": "webcam",
+  "description": "Webcam platform end-to-end tests",
+  "version": "6.2.2",
+  "directories": {
+    "test": "tests"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

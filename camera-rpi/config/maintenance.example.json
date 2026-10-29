@@ -1,0 +1,6 @@
+{
+  "url": "https://camera.example.invalid/camera-maintenance/",
+  "fingerprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "auth": "camera-example:REPLACE_WITH_SEPARATE_RANDOM_TUNNEL_SECRET",
+  "port": 22101
+}

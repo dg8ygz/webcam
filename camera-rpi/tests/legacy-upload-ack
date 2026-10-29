@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Test only the real response recognizers and transfer function extracted from
+# the worker. No worker main/USB/service/network/key access is executed here.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d /tmp/camera-legacy-ack.XXXXXXXX)"
+trap 'rm -rf -- "$STAGE"' EXIT
+source <(sed -n \
+  -e '/^upload_json_is_ok() {/,/^}/p' \
+  -e '/^upload_response_is_ok() {/,/^}/p' \
+  -e '/^chunk_response_is_ok() {/,/^}/p' \
+  -e '/^chunk_response_matches_upload() {/,/^}/p' \
+  -e '/^legacy_isoexp_line_is_valid() {/,/^}/p' \
+  -e '/^legacy_capture_stamp_is_valid() {/,/^}/p' \
+  -e '/^legacy_upload_feedback_is_ok() {/,/^}/p' \
+  -e '/^upload_legacy_transfer() {/,/^}/p' "$PROJECT/scripts/camera-rpi-worker")
+UPLOAD_RESPONSE_FILE="$STAGE/response"
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+for body in 'webcam_isoexp 0 2' 'webcam_isoexp 400 0' 'webcam_isoexp 1600' 'webcam_isoexp Auto' \
+  $'webcam_isoexp\t0\t2\r' 'webcam_isoexp 102400 5'; do
+  printf '%s\n' "$body" > "$UPLOAD_RESPONSE_FILE"
+  expect legacy_upload_feedback_is_ok
+done
+printf 'webcam_isoexp 0 2' > "$UPLOAD_RESPONSE_FILE"
+expect legacy_upload_feedback_is_ok
+for body in '' 'state=error Unauthorized.' '<html>error</html>' 'webcam_reboot' \
+  'webcam_isoexp 0 6' 'webcam_isoexp 0 -1' 'webcam_isoexp 200000 2' \
+  'webcam_isoexp 0400 2' 'webcam_isoexp 0 2; touch forbidden' \
+  'webcam_isoexp $(id) 2' '/usr/local/bin/webcam_isoexp 0 2' \
+  $'webcam_isoexp 0 2\nstate=error failed' $'webcam_isoexp 0 2\n' \
+  $'webcam_isoexp 0 2\rgarbage' $'webcam_isoexp 0 2\033'; do
+  printf '%s\n' "$body" > "$UPLOAD_RESPONSE_FILE"
+  if legacy_upload_feedback_is_ok; then printf 'FAIL: ungueltige Antwort akzeptiert\n' >&2; exit 1; fi
+  ((checks+=1))
+done
+printf 'webcam_isoexp 0 2\000\n' > "$UPLOAD_RESPONSE_FILE"
+if legacy_upload_feedback_is_ok; then exit 1; fi
+((checks+=1))
+printf 'webcam_isoexp 0 2%0130d\n' 0 > "$UPLOAD_RESPONSE_FILE"
+if legacy_upload_feedback_is_ok; then exit 1; fi
+((checks+=1))
+# HTTP and process exit guards: even a matching body cannot override a failure.
+CURL_BIN=fake_transfer
+UPLOAD_TIMEOUT_SECONDS=90
+UPLOAD_FORM_FILE="$STAGE/no-real-key"
+UPLOAD_HEADER_FILE="$STAGE/no-real-header"
+CAMERA_SLUG=bielefeld
+UPLOAD_URL=http://server.invalid/include/upload.php
+curl_common_arguments() { CURL_ARGUMENTS=(); }
+cr_log() { printf '%s\n' "$*" >> "$STAGE/log"; }
+fake_transfer() {
+  printf "%s\n" "$@" > "$STAGE/curl-args"
+  printf '%s' "$TEST_BODY" > "$UPLOAD_RESPONSE_FILE"
+  printf '%s' "$TEST_HTTP"
+  return "$TEST_EXIT"
+}
+TEST_BODY=$'webcam_isoexp 0 2\n'; TEST_HTTP=200; TEST_EXIT=0
+expect upload_legacy_transfer "$STAGE/fake.jpg" 1789241003
+expect grep -Fxq "X-Capture-Timestamp: 1789241003" "$STAGE/curl-args"
+expect grep -q 'nicht ausgefuehrt' "$STAGE/log"
+for TEST_HTTP in 204 301 401 403 500 000; do
+  if upload_legacy_transfer "$STAGE/fake.jpg" 1789241003; then exit 1; fi
+  ((checks+=1))
+done
+TEST_HTTP=200; TEST_EXIT=28
+if upload_legacy_transfer "$STAGE/fake.jpg" 1789241003; then exit 1; fi
+((checks+=1))
+TEST_EXIT=0
+for TEST_BODY in '' '{"ok":true}' '{"ok":true,"other":"data"}'; do
+  expect upload_legacy_transfer "$STAGE/fake.jpg" 1789241003
+done
+for TEST_BODY in '{"ok":false}' 'state=error Unauthorized.' 'webcam_reboot'; do
+  if upload_legacy_transfer "$STAGE/fake.jpg" 1789241003; then exit 1; fi
+  ((checks+=1))
+done
+printf 'OK: %s Legacy-Upload-Antwortpruefungen; HTTP/Transport/JSON/Text/Binaer/keine Ausfuehrung\n' "$checks"
+
+upload_id=0123456789abcdef0123456789abcdef
+for body in '{"ok":true,"protocol":"camera-rpi-chunk-v1","upload_id":"0123456789abcdef0123456789abcdef",BROKEN' \
+  '{"ok":true,"ok":false}' '{"ok":true,"o\u006b":false}' '{"ok":"true"}' \
+  '{"ok":1}' '{"ok":true,"x":NaN}' '[]'; do
+  printf '%s' "$body" > "$UPLOAD_RESPONSE_FILE"
+  if upload_response_is_ok; then echo 'FAIL: malformed JSON accepted'; exit 1; fi
+done
+printf '{"upload_id":"%s","protocol":"camera-rpi-chunk-v1","ok":true}' "$upload_id" > "$UPLOAD_RESPONSE_FILE"
+expect chunk_response_matches_upload "$upload_id"
+if chunk_response_matches_upload aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then exit 1; fi
+printf '{"ok":true,"protocol":"wrong","upload_id":"%s"}' "$upload_id" > "$UPLOAD_RESPONSE_FILE"
+if chunk_response_is_ok; then exit 1; fi
+printf 'OK: strict JSON, duplicate keys, types, protocol and correlated upload ID\n'

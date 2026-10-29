@@ -1,0 +1,27 @@
+# Echte Konfigurationen und Zugangsdaten duerfen niemals ins Repository.
+*.key
+*.secret
+.env
+.env.*
+admin.htpasswd
+config/servers/
+config/keys/
+config/*.local.conf
+
+# Laufzeit-, Kamera- und Warteschlangendaten gehoeren nur auf den Kamera-Pi.
+runtime/
+spool/
+*.pending
+*.request
+*.part
+*.jpg
+*.jpeg
+
+# Lokale Test- und Editorreste.
+*.log
+*.tmp
+*~
+.idea/
+.vscode/
+.phpunit.result.cache
+.deployed-commit

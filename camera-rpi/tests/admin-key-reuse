@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Isolated admin saves with dummy secrets: no real targets, keys or services.
+set -euo pipefail
+umask 077
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/camera-admin-key-test.XXXXXXXX")"
+trap 'rm -rf -- "$STAGE"' EXIT
+mkdir -p "$STAGE/servers" "$STAGE/keys" "$STAGE/run"
+checks=0
+expect() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; ((checks+=1)); }
+
+# All writes go to this private fixture tree; TEST_MODE disables systemctl.
+save() {
+  printf 'action=save\nserver_id=%s\nserver_base_url=https://%s.invalid/webcam\ncamera_slug=bielefeld\nenabled=false\nkey_mode=%s\nkey=%s\n' "$1" "$1" "$2" "$3" |
+    env CAMERA_RPI_ADMIN_TEST_MODE=1 CAMERA_RPI_CONFIG_DIR="$STAGE/servers" \
+      CAMERA_RPI_SOURCE_CONFIG="$STAGE/no-source" CAMERA_RPI_POOL_CONFIG="$STAGE/no-pool" \
+      CAMERA_RPI_KEY_DIR="$STAGE/keys" CAMERA_RPI_RUNTIME_ROOT="$STAGE/run" \
+      CAMERA_RPI_OPERATION_LOCK="$STAGE/operation.lock" \
+      CAMERA_RPI_COMMON_LIB="$PROJECT/scripts/lib/camera-rpi-common.sh" \
+      bash "$PROJECT/scripts/admin/camera-rpi-admin" > "$STAGE/result" 2> "$STAGE/error"
+}
+
+save first replace dummy-shared-key-1234
+expect save second replace dummy-shared-key-1234
+expect cmp -s "$STAGE/keys/first.key" "$STAGE/keys/second.key"
+expect test "$(stat -c %i "$STAGE/keys/first.key")" != "$(stat -c %i "$STAGE/keys/second.key")"
+for target in first second; do
+  expect test "$(stat -c '%a:%u:%g' "$STAGE/keys/$target.key")" = 600:0:0
+  expect grep -Fxq "key_file=$STAGE/keys/$target.key" "$STAGE/servers/$target.conf"
+done
+
+# Empty input keeps the same content AND inode, including a reused key.
+before="$(stat -c '%i:%Y:%s' "$STAGE/keys/second.key")"
+expect save second keep ''
+expect test "$before" = "$(stat -c '%i:%Y:%s' "$STAGE/keys/second.key")"
+expect cmp -s "$STAGE/keys/first.key" "$STAGE/keys/second.key"
+expect save first replace dummy-replaced-key-5678
+expect grep -Fxq dummy-shared-key-1234 "$STAGE/keys/second.key"
+expect grep -Fxq dummy-replaced-key-5678 "$STAGE/keys/first.key"
+expect save second replace dummy-replaced-key-5678
+expect cmp -s "$STAGE/keys/first.key" "$STAGE/keys/second.key"
+
+# Unrelated/orphaned files no longer make an otherwise valid save fail.
+printf 'invalid legacy leftover\n' > "$STAGE/keys/unrelated.key"
+expect save first keep ''
+if save third keep ''; then echo 'FAIL: new target accepted an absent key' >&2; exit 1; fi
+expect test ! -e "$STAGE/servers/third.conf"
+if save third replace 'invalid key'; then echo 'FAIL: invalid key format accepted' >&2; exit 1; fi
+expect test ! -e "$STAGE/keys/third.key"
+expect save second keep ''
+if grep -Eq 'dummy-(shared|replaced)-key' "$STAGE/result" "$STAGE/error"; then
+  echo 'FAIL: secret appeared in admin result' >&2; exit 1
+fi
+((checks+=1))
+# Operator-owned legacy servers may have four-character keys. Keep UI/admin
+# and worker validation aligned; shorter values are still rejected.
+expect save shortkey replace Ab12
+expect save shortkey keep ''
+if save tooshort replace Ab1; then echo 'Three-character key accepted' >&2; exit 1; fi
+((checks+=1))
+printf 'OK: %s shared-key admin checks; independent files/keep/replace/permissions/validation, no live services\n' "$checks"

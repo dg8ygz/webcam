@@ -1,0 +1,20 @@
+[Unit]
+Description=Restore completed camera queues and histories from shutdown checkpoint
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=camera-rpi-sensor-restore.service camera-rpi-sensor.service camera-rpi-climate.service
+RequiresMountsFor=/var/lib/camera-rpi/spool /var/lib/camera-rpi/reboot-backup
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/findmnt -rn -t tmpfs -M /var/lib/camera-rpi/spool
+ExecStart=/usr/bin/php -d opcache.enable_cli=0 -d opcache.file_cache= /usr/local/libexec/camera-rpi-reboot-data.php restore
+RemainAfterExit=yes
+TimeoutStartSec=120s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/camera-rpi-status /var/lib/camera-rpi/spool
+
+[Install]
+WantedBy=multi-user.target

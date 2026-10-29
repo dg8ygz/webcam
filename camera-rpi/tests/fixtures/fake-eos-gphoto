@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Hardware-free stand-in for the synchronous gphoto hook/child lifecycle.
+set -euo pipefail
+printf '%s\n' "$*" >> "$EOS_TEST_LOG"
+target='' hook='' pressed=0 released=0
+while (($#)); do
+  case "$1" in
+    --set-config-value)
+      case "$2" in
+        eosremoterelease=Immediate)
+          [[ "${EOS_TEST_CASE:-ok}" != press-fail ]] || exit 8
+          pressed=1; released=0 ;;
+        'eosremoterelease=Release Full')
+          if ((pressed)); then
+            [[ "${EOS_TEST_CASE:-ok}" != inline-release-fail ]] || exit 8
+          fi
+          released=1 ;;
+      esac
+      shift ;;
+    --capture-tethered=*)
+      # A held shutter must not reach the download phase.
+      ((pressed && released)) || { echo 'shutter not released before tether' >&2; exit 8; } ;;
+    --filename) target="$2"; shift ;;
+    --hook-script=*) hook="${1#*=}" ;;
+  esac
+  shift
+done
+if [[ -z "$target" ]]; then
+  [[ "${EOS_TEST_RELEASE_DELAY:-0}" == 0 ]] || sleep "$EOS_TEST_RELEASE_DELAY"
+  [[ "${EOS_TEST_CASE:-ok}" != release-fail ]]
+  exit $?
+fi
+# gphoto2 2.5.28 first creates tmpfileXXXXXX in CWD, NOT beside --filename.
+# Model that dependency so a test launched in /proc exposes a missing chdir;
+# a writable repository directory previously concealed the worker's RO-CWD bug.
+[[ -z "${EOS_TEST_CWD_LOG:-}" ]] || pwd -P >> "$EOS_TEST_CWD_LOG"
+temporary="$(mktemp tmpfile.XXXXXX 2>/dev/null)" || {
+  printf 'EOS fixture: no writable download working directory\n' >&2
+  exit 0
+}
+rm -f -- "$temporary"
+case "${EOS_TEST_CASE:-ok}" in
+  fail) exit 8 ;;
+  no-file) exit 0 ;;
+  killed) kill -KILL "$BASHPID" ;;
+  hang) exec sleep 60 ;;
+esac
+if [[ "${EOS_TEST_CASE:-ok}" == raw ]]; then
+  head -c 2048 /dev/zero > "$target"
+elif [[ "${EOS_TEST_CASE:-ok}" == oversized ]]; then
+  { printf '\377\330'; head -c 3000 /dev/zero; printf '\377\331'; } > "$target"
+else
+  cp -- "$(dirname -- "${BASH_SOURCE[0]}")/capture.jpg" "$target"
+fi
+ACTION=download ARGUMENT="$target" "$hook"
+# A hook that fails to terminate its own parent must not pass the tests.
+exit 9

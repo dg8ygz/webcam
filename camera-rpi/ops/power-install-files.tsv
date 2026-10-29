@@ -1,0 +1,11 @@
+# source|target|mode|expected installed baseline (absent for new files)
+scripts/camera-rpi-power.php|/usr/local/libexec/camera-rpi-power.php|0644|absent
+scripts/camera-rpi-gpio.php|/usr/local/libexec/camera-rpi-gpio.php|0644|ca966e10ed0cea74b132361a588e1861609e1d320acf29271c2fd335cf1fbd14
+scripts/admin/camera-rpi-admin|/usr/local/sbin/camera-rpi-admin|0750|ca15cb1ff5650cf57e2251131abb83b613efb83f5b4307ab176e2788d5f65000
+admin/src/power.php|/usr/local/share/camera-rpi-admin/src/power.php|0644|absent
+admin/src/power-panel.php|/usr/local/share/camera-rpi-admin/src/power-panel.php|0644|absent
+admin/public/power.js|/usr/local/share/camera-rpi-admin/public/power.js|0644|absent
+admin/public/power-status.php|/usr/local/share/camera-rpi-admin/public/power-status.php|0644|absent
+admin/public/style.css|/usr/local/share/camera-rpi-admin/public/style.css|0644|1785456e6d00bbfab8c429b5e9fe0eaae8172439911d802d6b3db7c849e96a03
+admin/public/index.php|/usr/local/share/camera-rpi-admin/public/index.php|0644|86bd8642e2c15cfe25edb61ab7f903e628d9218bd1db5e3ccf6126bcd67028ee
+systemd/camera-rpi-camera-power.service|/etc/systemd/system/camera-rpi-camera-power.service|0644|8e25fc234e33eda270da8398b29dda355208c33718086e850b7a244b4001ff55

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# One serialized write window; ExecStopPost also restores mounts after SIGKILL.
+set -euo pipefail
+umask 077
+[[ $EUID == 0 ]] || { echo 'Root required' >&2; exit 1; }
+mode=${1:-run}
+[[ $mode == run || $mode == restore ]] || exit 2
+state=${CAMERA_RPI_MAINT_STATE_DIR:-/run/camera-rpi-system-maintenance}
+lock=${CAMERA_RPI_OPERATION_LOCK:-/run/lock/camera-rpi.operation.lock}
+findmnt_bin=${CAMERA_RPI_FINDMNT_BIN:-/usr/bin/findmnt}
+mount_bin=${CAMERA_RPI_MOUNT_BIN:-/usr/bin/mount}
+sync_bin=${CAMERA_RPI_SYNC_BIN:-/usr/bin/sync}
+systemctl_bin=${CAMERA_RPI_SYSTEMCTL_BIN:-/usr/bin/systemctl}
+apt_bin=${CAMERA_RPI_APT_DAILY_BIN:-/usr/lib/apt/apt.systemd.daily}
+logrotate_bin=${CAMERA_RPI_LOGROTATE_BIN:-/usr/sbin/logrotate}
+legacy_jobs=${CAMERA_RPI_MAINT_LEGACY_JOBS:-0}
+[[ $legacy_jobs == 0 || $legacy_jobs == 1 ]] || { echo 'Invalid legacy job switch' >&2; exit 2; }
+trixie_jobs=${CAMERA_RPI_MAINT_TRIXIE_JOBS:-0}
+[[ $trixie_jobs == 0 || $trixie_jobs == 1 ]] || { echo 'Invalid Trixie job switch' >&2; exit 2; }
+clock_bin=${CAMERA_RPI_FAKE_HWCLOCK_BIN:-/usr/sbin/fake-hwclock}
+locate_bin=${CAMERA_RPI_LOCATE_DAILY_BIN:-/etc/cron.daily/locate}
+python_bin=${CAMERA_RPI_PYTHON_BIN:-/usr/bin/python3}
+dpkg_backup_bin=${CAMERA_RPI_DPKG_BACKUP_BIN:-/usr/libexec/dpkg/dpkg-db-backup}
+timeout_bin=${CAMERA_RPI_TIMEOUT_BIN:-/usr/bin/timeout}
+mkdir -p "$state"
+exec 9>"$lock"
+flock -w 120 9 || { echo 'ERROR: camera operation lock busy; no remount' >&2; exit 1; }
+readonly_mount() {
+  local options
+  options=$("$findmnt_bin" -n -o OPTIONS -T "$1") || return 1
+  [[ ,$options, == *,ro,* ]]
+}
+restore() {
+  local name target result=0
+  # Boot must be closed before root. Markers survive main-process SIGKILL.
+  for name in firmware boot root; do
+    [[ -f $state/$name ]] || continue
+    target=$(cat "$state/$name")
+    case "$name:$target" in root:/|boot:/boot|firmware:/boot/firmware) ;; *) echo 'ERROR: invalid mount marker' >&2; return 1;; esac
+    "$sync_bin" -f "$target" || result=1
+    if readonly_mount "$target" || "$mount_bin" -o remount,ro "$target"; then
+      if readonly_mount "$target"; then
+        rm -f "$state/$name"
+        echo "Restored RO: $target"
+      else
+        echo "CRITICAL: RO verification failed: $target" >&2; result=1
+      fi
+    else
+      echo "CRITICAL: cannot restore RO: $target" >&2; result=1
+    fi
+  done
+  return "$result"
+}
+[[ $mode != restore ]] || { restore; exit $?; }
+[[ ! -e $state/root && ! -e $state/boot && ! -e $state/firmware ]] || {
+  echo 'ERROR: previous write window not restored; recovery only' >&2
+  restore
+  exit 1
+}
+readonly_mount / || { echo 'ERROR: root already RW; foreign maintenance window left untouched' >&2; exit 1; }
+for boot in /boot /boot/firmware; do
+  if "$findmnt_bin" -rn -M "$boot" >/dev/null && ! readonly_mount "$boot"; then
+    echo "ERROR: $boot already RW; foreign maintenance window left untouched" >&2
+    exit 1
+  fi
+done
+# Never overlap an independently started package/logrotate systemd job.
+units=(apt-daily.service apt-daily-upgrade.service logrotate.service)
+if [[ $legacy_jobs == 1 ]]; then
+  units+=(fake-hwclock-save.service locate.service)
+  [[ -x $clock_bin && -x $locate_bin ]] || { echo 'Missing legacy job executable' >&2; exit 1; }
+fi
+if [[ $trixie_jobs == 1 ]]; then
+  units+=(apt-listchanges.service dpkg-db-backup.service)
+  [[ -x $python_bin && -x $dpkg_backup_bin && -x $timeout_bin ]] || { echo 'Missing Trixie job executable' >&2; exit 1; }
+fi
+for unit in "${units[@]}"; do
+  active=$("$systemctl_bin" show "$unit" -p ActiveState --value)
+  case "$active" in inactive|failed) ;; *) echo "ERROR: $unit is $active; no remount" >&2; exit 1;; esac
+done
+finish() {
+  local result=$?
+  trap - EXIT
+  restore || result=1
+  exit "$result"
+}
+trap finish EXIT
+trap 'exit 143' TERM HUP
+trap 'exit 130' INT
+# Record ownership before remount, closing the signal/crash gap.
+printf '/\n' > "$state/root"
+"$mount_bin" -o remount,rw /
+echo 'Maintenance root RW'
+for boot in /boot /boot/firmware; do
+  if "$findmnt_bin" -rn -M "$boot" >/dev/null; then
+    if readonly_mount "$boot"; then
+      name=boot
+      [[ $boot != /boot/firmware ]] || name=firmware
+      printf '%s\n' "$boot" > "$state/$name"
+      "$mount_bin" -o remount,rw "$boot"
+      echo "Maintenance boot RW: $boot"
+    fi
+  fi
+done
+result=0
+job() {
+  local unit=$1
+  shift
+  echo "START $unit"
+  if "$@"; then
+    echo "OK $unit"
+    # Inactive oneshots may already have been garbage-collected by systemd.
+    # Only failed units retain an error state which actually needs resetting.
+    local previous
+    if previous=$("$systemctl_bin" show "$unit" -p ActiveState --value); then
+      if [[ $previous == failed ]]; then
+        "$systemctl_bin" reset-failed "$unit" || result=1
+      fi
+    else
+      result=1
+    fi
+  else
+    local rc=$?
+    echo "ERROR $unit exit=$rc" >&2
+    result=1
+  fi
+}
+job apt-daily.service "$apt_bin" update
+job apt-daily-upgrade.service "$apt_bin" install
+if [[ -n ${CAMERA_RPI_LOGROTATE_STATE:-} ]]; then
+  job logrotate.service "$logrotate_bin" --state "$CAMERA_RPI_LOGROTATE_STATE" /etc/logrotate.conf
+else
+  job logrotate.service "$logrotate_bin" /etc/logrotate.conf
+fi
+if [[ $legacy_jobs == 1 ]]; then
+  job fake-hwclock-save.service "$clock_bin" save
+  job locate.service "$locate_bin" systemd-timer
+fi
+if [[ $trixie_jobs == 1 ]]; then
+  # Populate locally; never fetch changelogs or install packages here. Already
+  # recorded packages are skipped. Partial progress survives a bounded retry.
+  job apt-listchanges.service "$timeout_bin" --kill-after=5 120 "$python_bin" -m apt_listchanges.populate_database --profile apt --no-network
+  job dpkg-db-backup.service "$timeout_bin" --kill-after=5 120 "$dpkg_backup_bin"
+fi
+exit "$result"

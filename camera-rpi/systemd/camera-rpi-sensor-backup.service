@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily durable camera sensor snapshot
+After=local-fs.target time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/camera-rpi-sensor-backup
+UMask=0077
+TimeoutStartSec=5min
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+# No mount namespace: the helper restores the real root mount to RO if needed.

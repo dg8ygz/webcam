@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# No system journal access. Assert the exact readonly argument vector.
+set -euo pipefail
+[[ "$*" == '--unit=camera-rpi-worker@journal-test.service --lines=10 --no-pager --quiet --output=short-iso' ]] || exit 2
+[[ "${FAKE_JOURNAL_FAIL:-0}" == 0 ]] || exit 1
+for n in $(seq 1 10); do
+  printf '2026-09-12T23:00:%02d worker: <script>test</script> key-journal-12345\n' "$n"
+done

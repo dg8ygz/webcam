@@ -1,0 +1,39 @@
+[Unit]
+Description=Camera-RPi Taupunkt-Heizung und Feuchte-PWM
+Documentation=file:/usr/local/share/doc/camera-rpi/CLIMATE.md
+After=systemd-tmpfiles-setup.service camera-rpi-sensor.service
+ConditionPathExists=/etc/camera-rpi/climate.json
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+# PCRE JIT needs executable memory; keep the hardening below and use its interpreter.
+ExecStart=/usr/bin/php -d pcre.jit=0 -d opcache.enable_cli=0 -d opcache.file_cache= /usr/local/libexec/camera-rpi-climate.php run
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=10s
+NotifyAccess=main
+TimeoutStopSec=5s
+RuntimeDirectory=camera-rpi-climate
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/camera-rpi-climate /run/camera-rpi-status
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
